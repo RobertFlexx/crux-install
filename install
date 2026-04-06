@@ -1,390 +1,591 @@
 #!/bin/sh
-# Copyright 2019 Andy Kosela.  All rights reserved.
+# Original work Copyright 2019 Andy Kosela.  All rights reserved.
+# Modifications Copyright 2026 Robert.  All rights reserved.
 # Use of this source code is governed by a BSD-style
 # license that can be found in the LICENSE file.
+#
+# enhanced fork adding crux 3.8 support, improved partitioning,
+# optional desktop environments (kde plasma and xfce), and flatpak
+# integration.
 
-version=3.4
+version=3.8-fork
+PATH=/usr/bin:/usr/sbin:/bin:/sbin
+umask 022
 
 main() {
-	echo "Welcome to the CRUX $version installation program."
-	echo "" 
-	echo -n "(I)nstall, (U)pgrade, or (S)hell? [i] "
-	read resp
-	case $resp in
-	[Ii])
-		install
-		;;
-	[Uu])
-		upgrade
-		;;
-	[Ss])
-		shell
-		;;
-	*)
-		install
-		;;
-	esac
+    echo "Welcome to the CRUX $version installation program."
+    echo ""
+    echo -n "(I)nstall, (U)pgrade, or (S)hell? [i] "
+    read resp
+    case "$resp" in
+        [Uu]) upgrade ;;
+        [Ss]) shell ;;
+        *) install ;;
+    esac
 }
 
 shell() {
-	exit
+    exit 0
 }
 
-upgrade() {
-	disk
-	diskn
-	echo -n "Which partition is the root? [${rdisk}2] "
-	read rdiskr
-	rdiskr=${rdiskr:-${rdisk}2}
-	mount /dev/$rdiskr /mnt
-	/usr/bin/setup
-	chroot
-	upgrade_kernel
-	end
+say() {
+    printf '%s\n' "$*"
 }
 
-install() {
-	hostname
-	network
-	timezone
-	disk
-	diskn
-	pdisk
-	setup
-	chroot
-	password
-	user
-	etc
-	kernel
-	end
+warn() {
+    printf 'warning: %s\n' "$*" >&2
 }
 
-hostname() {
-	echo -n "System hostname? [crux] "
-	read hostn
-	hostn=${hostn:-crux}
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
 }
 
-network() {
-	nic=`ifconfig -a | grep HWaddr | cut -d' ' -f1 | paste -sd ' '`
-	nic1=`echo $nic | cut -d' ' -f1`
-	echo ""
-	echo "Available network interfaces are: $nic"
-	echo -n "Which network interface do you wish to configure? (or (N)one) [$nic1] "
-	read nic_conf
-	case $nic_conf in
-	[NnOoNnEe]*)
-		nic_conf=''
-		;;
-	*)
-		nic_conf=${nic_conf:-$nic1}
-		ipv4
-		;;
-	esac
+ask() {
+    prompt=$1
+    def=$2
+    printf '%s [%s] ' "$prompt" "$def"
+    read ans
+    if [ -n "$ans" ]; then
+        printf '%s' "$ans"
+    else
+        printf '%s' "$def"
+    fi
 }
 
-ipv4() {
-	echo -n "IPv4 address for $nic_conf? [dhcp] "
-	read ip
-	case $ip in
-	[0-9]*)
-		echo -n "Subnet mask for $nic_conf? [24] "
-		read subnet_mask
-		subnet_mask=${subnet_mask:-24}
-
-		gw=`echo $ip | sed 's/\([0-9]*.[0-9]*.[0-9]*.\)[0-9]*/\11/'`
-		echo -n "Gateway for $nic_conf? [$gw] "
-		read gw2
-		gw2=${gw2:-$gw}
-		echo -n "Primary DNS server? [$gw2] "
-		read ns1
-		ns1=${ns1:-$gw2}
-		echo -n "Secondary DNS server? [none] "
-		read ns2
-		;;
-	*)
-		ip=dhcp
-		;;
-	esac
+ask_optional() {
+    prompt=$1
+    def=$2
+    printf '%s [%s] ' "$prompt" "$def"
+    read ans
+    if [ -n "$ans" ]; then
+        printf '%s' "$ans"
+    else
+        printf '%s' "$def"
+    fi
 }
 
-timezone() {
-	echo -n "What timezone are you in? [UTC] "
-	read tzone
-	tzone=${tzone:-UTC}
+confirm_yes() {
+    prompt=$1
+    def=$2
+    printf '%s [%s] ' "$prompt" "$def"
+    read ans
+    ans=${ans:-$def}
+    case "$ans" in
+        [Yy]|[Yy][Ee][Ss]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_uefi() {
+    [ -d /sys/firmware/efi/efivars ]
+}
+
+partdev() {
+    num=$1
+    case "$rdisk" in
+        *[0-9]) printf '/dev/%sp%s' "$rdisk" "$num" ;;
+        *) printf '/dev/%s%s' "$rdisk" "$num" ;;
+    esac
+}
+
+blk_uuid() {
+    blkid -s UUID -o value "$1" 2>/dev/null
+}
+
+mount_bindings() {
+    mkdir -p /mnt/dev /mnt/tmp /mnt/run /mnt/proc /mnt/sys /mnt/dev/pts
+    mount --bind /dev /mnt/dev
+    mount --bind /tmp /mnt/tmp
+    mount --bind /run /mnt/run
+    mount -t proc proc /mnt/proc
+    mount -t sysfs sysfs /mnt/sys
+    mount -t devpts -o noexec,nosuid,gid=tty,mode=0620 devpts /mnt/dev/pts
+    if [ -d /sys/firmware/efi/efivars ]; then
+        mkdir -p /mnt/sys/firmware/efi/efivars
+        mount --bind /sys/firmware/efi/efivars /mnt/sys/firmware/efi/efivars
+    fi
+    chr="/usr/bin/chroot /mnt"
+}
+
+network_interfaces() {
+    if command -v ip >/dev/null 2>&1; then
+        ip -o link show | awk -F': ' '$2 != "lo" {sub(/@.*/, "", $2); print $2}' | paste -sd ' ' -
+    else
+        ifconfig -a 2>/dev/null | awk -F: '/^[A-Za-z0-9]/ {print $1}' | grep -v '^lo$' | paste -sd ' ' -
+    fi
+}
+
+hostname_cfg() {
+    hostn=$(ask "System hostname?" "crux")
+}
+
+network_cfg() {
+    nic=$(network_interfaces)
+    nic1=$(printf '%s' "$nic" | awk '{print $1}')
+    echo ""
+    echo "Available network interfaces are: ${nic:-none detected}"
+    nic_conf=$(ask_optional "Which network interface do you wish to configure? (or none)" "${nic1:-none}")
+    case "$nic_conf" in
+        none|NONE|None|'')
+            nic_conf=''
+            ip=''
+            gw2=''
+            ns1=''
+            ns2=''
+            ;;
+        *) ipv4_cfg ;;
+    esac
+}
+
+ipv4_cfg() {
+    ip=$(ask_optional "IPv4 address for $nic_conf?" "dhcp")
+    case "$ip" in
+        [0-9]*.[0-9]*.[0-9]*.[0-9]*)
+            subnet_mask=$(ask_optional "CIDR subnet mask for $nic_conf?" "24")
+            gw=$(printf '%s' "$ip" | sed 's/\([0-9]*\.[0-9]*\.[0-9]*\.\)[0-9]*/\11/')
+            gw2=$(ask_optional "Gateway for $nic_conf?" "$gw")
+            ns1=$(ask_optional "Primary DNS server?" "$gw2")
+            ns2=$(ask_optional "Secondary DNS server?" "")
+            ;;
+        *)
+            ip=dhcp
+            gw2=''
+            ns1=''
+            ns2=''
+            ;;
+    esac
+}
+
+timezone_cfg() {
+    tzone=$(ask "What timezone are you in?" "UTC")
 }
 
 disk() {
-	disks=`lsblk | grep disk | cut -d' ' -f1 | paste -sd ' '`
-	disk1=`echo $disks | cut -d' ' -f1`
-	echo ""
-	echo "Available disks are: $disks"
+    echo ""
+    if command -v lsblk >/dev/null 2>&1; then
+        lsblk -d -n -o NAME,SIZE,MODEL,TYPE | awk '$4 == "disk" {printf "  %-12s %-8s %s\n", $1, $2, $3}'
+        disks=$(lsblk -d -n -o NAME,TYPE | awk '$2 == "disk" {print $1}' | paste -sd ' ' -)
+    else
+        disks=$(fdisk -l 2>/dev/null | awk '/^Disk \/dev\// {sub("/dev/", "", $2); sub(":", "", $2); print $2}' | paste -sd ' ' -)
+    fi
+    disk1=$(printf '%s' "$disks" | awk '{print $1}')
+    echo "Available disks are: $disks"
 }
 
 diskn() {
-	echo -n "Which disk is the root disk? ('?' for details) [$disk1] "
-	read rdisk
-	case $rdisk in
-	?)
-		lsblk | grep -e NAME -e disk
-		diskn
-		;;
-	*)
-		rdisk=${rdisk:-$disk1}
-		;;
-	esac
-}
-
-pdisk() {
-	echo ""
-	echo -n "(A)uto-partition or (F)disk? [a] "
-	read resp
-	case $resp in
-	[Aa])
-		autopart
-		;;
-	[Ff])
-		filesystem
-		fdisk /dev/$rdisk
-		echo -n "Which partition is the swap? [${rdisk}1] "
-		read sw
-		sw=${sw:-${rdisk}1}
-		mkswap /dev/$sw >/dev/null 2>&1
-		swapon /dev/$sw >/dev/null 2>&1
-
-		echo -n "Which partition is the root? [${rdisk}2] "
-		read rdiskr
-		rdiskr=${rdiskr:-${rdisk}2}
-
-		makefs
-		mount /dev/$rdiskr /mnt
-		rdiskrtmp=$rdiskr
-
-		echo -n "Do you have other partitions? [n] "
-		read resp
-		case $resp in
-		[Yy])
-			echo -n "Which partition is the /boot? [none] "
-			read boot
-			if [ ! $boot = '' ]; then
-				rdiskr=$boot
-				makefs
-				mount /dev/$boot /mnt/boot
-			fi
-			echo -n "Which partition is the /home? [none] "
-			read home
-			if [ ! $home = '' ]; then
-				rdiskr=$home
-				makefs
-				mount /dev/$home /mnt/home
-			fi
-			echo -n "Which partition is the /tmp? [none] "
-			read tmp
-			if [ ! $tmp = '' ]; then
-				rdiskr=$tmp
-				makefs
-				mount /dev/$tmp /mnt/tmp
-			fi
-			echo -n "Which partition is the /usr? [none] "
-			read usr
-			if [ ! $usr = '' ]; then
-				rdiskr=$usr
-				makefs
-				mount /dev/$usr /mnt/usr
-			fi
-			echo -n "Which partition is the /var? [none] "
-			read var
-			if [ ! $var = '' ]; then
-				rdiskr=$var
-				makefs
-				mount /dev/$var /mnt/var
-			fi
-			rdiskr=$rdiskrtmp
-			;;
-		*)
-			;;
-		esac
-		;;
-	*)
-		autopart
-		;;
-	esac
+    printf "Which disk is the target disk? ('?' for details) [%s] " "$disk1"
+    read rdisk
+    case "$rdisk" in
+        '?')
+            lsblk -o NAME,SIZE,FSTYPE,TYPE,MOUNTPOINT
+            diskn
+            ;;
+        '')
+            rdisk=$disk1
+            ;;
+    esac
 }
 
 filesystem() {
-	echo -n "Which filesystem you want to use? ('?' for list) [ext4] "
-	read fs
-	case $fs in
-	[EeXxTt2]*)
-		fs=ext2
-		;;
-	[EeXxTt3]*)
-		fs=ext3
-		;;
-	[EeXxTt4]*)
-		fs=ext4
-		;;
-	[BbTtRrFfSs]*)
-		fs=btrfs
-		;;
-	[JjFfSs]*)
-		fs=jfs
-		;;
-	[XxFfSs]*)
-		fs=xfs
-		;;
-	?)
-		echo "ext2, ext3, ext4, btrfs, jfs, xfs"
-		filesystem
-		;;
-	*)
-		fs=ext4
-		;;
-	esac
-}
-
-autopart() {
-	echo "Auto-partition will erase all your data!"
-	echo -n "Do you wish to continue? [y] "
-	read resp
-	case $resp in
-	[Nn])
-		shell
-		;;
-	[Yy])
-		resp=yes
-		;;
-	*)
-		resp=yes
-		;;
-	esac
-
-	wipefs -a /dev/$rdisk >/dev/null 2>&1
-	filesystem
-	echo -n "Size of the swap partition? (in MB) [1024] "
-	read sizesw
-	sizesw=${sizesw:-1024}
-	sw=${rdisk}1
-
-	echo "n\np\n1\n\n+${sizesw}m\ntype\n82\nw\n" |
-		fdisk /dev/$rdisk >/dev/null 2>&1
-	echo "n\np\n2\n\n\nw\n" | fdisk /dev/$rdisk >/dev/null 2>&1
-	partprobe /dev/$rdisk
-	mkswap /dev/$sw >/dev/null 2>&1
-	swapon /dev/$sw >/dev/null 2>&1
-
-	rdiskr=${rdisk}2
-	makefs
-	mount /dev/$rdiskr /mnt
+    printf "Which root filesystem do you want to use? ('?' for list) [ext4] "
+    read fs
+    case "$fs" in
+        ext2|EXT2|Ext2) fs=ext2 ;;
+        ext3|EXT3|Ext3) fs=ext3 ;;
+        ext4|EXT4|Ext4|'') fs=ext4 ;;
+        btrfs|BTRFS|Btrfs) fs=btrfs ;;
+        xfs|XFS|Xfs) fs=xfs ;;
+        jfs|JFS|Jfs) fs=jfs ;;
+        '?')
+            echo "ext2, ext3, ext4, btrfs, jfs, xfs"
+            filesystem
+            ;;
+        *)
+            fs=ext4
+            ;;
+    esac
 }
 
 makefs() {
-	if [ $fs = jfs ]; then
-		mkfs.$fs -f /dev/$rdiskr >/dev/null 2>&1
-	else
-		mkfs.$fs /dev/$rdiskr >/dev/null 2>&1
-	fi
+    target=$1
+    case "$fs" in
+        jfs) mkfs.jfs -q -f "$target" >/dev/null 2>&1 ;;
+        btrfs) mkfs.btrfs -f "$target" >/dev/null 2>&1 ;;
+        xfs) mkfs.xfs -f "$target" >/dev/null 2>&1 ;;
+        *) mkfs."$fs" "$target" >/dev/null 2>&1 ;;
+    esac
 }
 
-setup() {
-	echo "Your CRUX root partition has been mounted at /mnt."
-	echo ""
-	echo -n "Core packages only? [y] "
-	read resp
-	case $resp in
-	[Nn])
-		k=1
-		/usr/bin/setup
-		;;
-	*)
-		k=0
-		install_pkg
-		;;
-	esac
+pdisk() {
+    echo ""
+    home=''
+    if is_uefi; then
+        say "UEFI boot mode detected."
+    else
+        say "Legacy BIOS boot mode detected."
+    fi
+    printf "(A)uto-partition or (M)anual partitioning shell? [a] "
+    read resp
+    case "$resp" in
+        [Mm]) manual_part ;;
+        *) autopart ;;
+    esac
 }
 
-install_pkg() {
-	crux=/media/crux
-	src=/mnt/usr/src
+manual_part() {
+    filesystem
+    echo "Launching cfdisk for /dev/$rdisk"
+    cfdisk "/dev/$rdisk"
 
-	if [ ! -d /mnt/var/lib/pkg ]; then
-		mkdir -p /mnt/var/lib/pkg
-		touch /mnt/var/lib/pkg/db
-	fi
-	if [ -d /mnt/var/lib/pkg/rejected ]; then
-		rm -rf /mnt/var/lib/pkg/rejected
-	fi
-	if [ ! -d $src ]; then
-		mkdir -p $src
-	fi
-	if [ ! -d /mnt/root ]; then
-		mkdir -p /mnt/root
-	fi
+    if is_uefi; then
+        boot=$(ask_optional "Which partition is the EFI System Partition?" "$(partdev 1)")
+    else
+        boot=''
+    fi
 
-	echo -n "Installing packages... "
-	for pkg in `ls -1 $crux/core`; do
-		pkgadd -r /mnt $crux/core/$pkg >/dev/null 2>&1
-	done
+    sw=$(ask_optional "Which partition is the swap?" "$(partdev 2)")
+    rdiskr=$(ask_optional "Which partition is the root?" "$(partdev 3)")
+    if confirm_yes "Do you want a separate /home partition?" "n"; then
+        home=$(ask_optional "Which partition is /home?" "")
+    fi
+
+    [ -n "$sw" ] && mkswap "$sw" >/dev/null 2>&1 && swapon "$sw" >/dev/null 2>&1
+    makefs "$rdiskr"
+    mount "$rdiskr" /mnt || die "failed to mount root partition"
+
+    if [ -n "$home" ]; then
+        mkdir -p /mnt/home
+        mount "$home" /mnt/home || die "failed to mount /home"
+    fi
+
+    if [ -n "$boot" ]; then
+        mkdir -p /mnt/boot
+        mkfs.vfat -F32 "$boot" >/dev/null 2>&1 || true
+        mount "$boot" /mnt/boot || die "failed to mount EFI partition"
+    fi
 }
 
-chroot() {
-	mount --bind /dev /mnt/dev
-	mount --bind /tmp /mnt/tmp
-	mount --bind /run /mnt/run
-	mount -t proc proc /mnt/proc
-	mount -t sysfs none /mnt/sys
-	mount -t devpts -o noexec,nosuid,gid=tty,mode=0620 devpts /mnt/dev/pts
+autopart() {
+    echo "Auto-partition will erase all data on /dev/$rdisk."
+    confirm_yes "Do you wish to continue?" "y" || shell
+    filesystem
 
-	if grep -qs /sys/firmware/efi/efivars /proc/mounts; then
-		mount --bind /sys/firmware/efi/efivars \
-			/mnt/sys/firmware/efi/efivars
-	fi
-	chr="/usr/bin/chroot /mnt"
+    if is_uefi; then
+        sizeefi=$(ask_optional "Size of the EFI System Partition in MB?" "512")
+        sizesw=$(ask_optional "Size of the swap partition in MB?" "2048")
+        wipefs -a "/dev/$rdisk" >/dev/null 2>&1
+        cat <<LAYOUT | sfdisk --wipe always "/dev/$rdisk" >/dev/null 2>&1
+label: gpt
+,${sizeefi}M,U
+,${sizesw}M,S
+,,L
+LAYOUT
+        partprobe "/dev/$rdisk" >/dev/null 2>&1 || true
+        boot=$(partdev 1)
+        sw=$(partdev 2)
+        rdiskr=$(partdev 3)
+        mkfs.vfat -F32 "$boot" >/dev/null 2>&1 || die "failed to create EFI filesystem"
+        mkswap "$sw" >/dev/null 2>&1 || die "failed to create swap"
+        swapon "$sw" >/dev/null 2>&1 || true
+        makefs "$rdiskr"
+        mount "$rdiskr" /mnt || die "failed to mount root partition"
+        mkdir -p /mnt/boot
+        mount "$boot" /mnt/boot || die "failed to mount EFI partition"
+    else
+        sizesw=$(ask_optional "Size of the swap partition in MB?" "2048")
+        wipefs -a "/dev/$rdisk" >/dev/null 2>&1
+        cat <<LAYOUT | sfdisk --wipe always "/dev/$rdisk" >/dev/null 2>&1
+label: dos
+,${sizesw}M,S
+,,L,*
+LAYOUT
+        partprobe "/dev/$rdisk" >/dev/null 2>&1 || true
+        sw=$(partdev 1)
+        rdiskr=$(partdev 2)
+        boot=''
+        mkswap "$sw" >/dev/null 2>&1 || die "failed to create swap"
+        swapon "$sw" >/dev/null 2>&1 || true
+        makefs "$rdiskr"
+        mount "$rdiskr" /mnt || die "failed to mount root partition"
+    fi
 }
 
-password() {
-	sed -i -e '/PASS_ALWAYS_WARN/s/yes/no/' \
-		-e '/USERGROUPS_ENAB/s/no/yes/' /mnt/etc/login.defs \
-		>/dev/null 2>&1
-	echo ""
-	echo "Creating password for root account."
-	$chr passwd -q
+setup_packages() {
+    echo ""
+    say "Your CRUX root partition has been mounted at /mnt."
+    if confirm_yes "Launch the official CRUX package selector?" "y"; then
+        /usr/bin/setup || die "official CRUX setup failed"
+    else
+        install_core_pkgs
+        install_bootloader_pkgs
+    fi
 }
 
-user() {
-	echo -n "Please create a local account. [user] "
-	read RESP
-	RESP=${RESP:-user}
-	export RESP
-	$chr useradd -m -c $RESP -s /bin/bash $RESP
-	$chr passwd -q $RESP
+install_core_pkgs() {
+    crux=/media/crux
+    [ -d "$crux/core" ] || die "could not find ISO packages at $crux/core"
+
+    mkdir -p /mnt/var/lib/pkg /mnt/usr/src /mnt/root
+    [ -f /mnt/var/lib/pkg/db ] || : > /mnt/var/lib/pkg/db
+    rm -rf /mnt/var/lib/pkg/rejected 2>/dev/null || true
+
+    echo -n "Installing core packages from ISO... "
+    for pkg in "$crux"/core/*; do
+        [ -f "$pkg" ] || continue
+        pkgadd -r /mnt "$pkg" >/dev/null 2>&1 || die "failed to install $(basename "$pkg")"
+    done
+    echo "done"
 }
 
-etc() {
-	cat >/mnt/etc/fstab <<EOF
-/dev/$rdiskr / $fs defaults 0 1
-/dev/$sw swap swap defaults 0 0
-devpts /dev/pts devpts noexec,nosuid,gid=tty,mode=0620 0 0
-shm /dev/shm tmpfs defaults 0 0
-EOF
+find_iso_pkg() {
+    collection=$1
+    name=$2
+    find "/media/crux/$collection" -maxdepth 1 -type f \( -name "${name}#*.pkg.tar.gz" -o -name "${name}#*.pkg.tar.xz" -o -name "${name}#*.pkg.tar.zst" -o -name "${name}#*.pkg.tar.bz2" \) | sort | tail -n 1
+}
 
-	cat >/mnt/etc/hosts <<EOF
-127.0.0.1	localhost
-EOF
-	if [ ! $ns1 = '' ]; then
-		if [ ! $ns2 = '' ]; then
-			cat >/mnt/etc/resolv.conf <<EOF
+install_iso_pkg() {
+    collection=$1
+    name=$2
+    pkg=$(find_iso_pkg "$collection" "$name")
+    [ -n "$pkg" ] || return 1
+    pkgadd -r /mnt "$pkg" >/dev/null 2>&1
+}
+
+install_bootloader_pkgs() {
+    if is_uefi; then
+        install_iso_pkg opt grub2 >/dev/null 2>&1 || true
+        install_iso_pkg opt grub2-efi >/dev/null 2>&1 || true
+        install_iso_pkg opt efibootmgr >/dev/null 2>&1 || true
+    else
+        install_iso_pkg opt grub2 >/dev/null 2>&1 || true
+    fi
+}
+
+password_cfg() {
+    sed -i -e '/PASS_ALWAYS_WARN/s/yes/no/' \
+           -e '/USERGROUPS_ENAB/s/no/yes/' \
+           /mnt/etc/login.defs >/dev/null 2>&1 || true
+    echo ""
+    echo "Creating password for root account."
+    $chr passwd -q || $chr passwd
+}
+
+user_cfg() {
+    user_name=$(ask_optional "Please create a local account." "user")
+    $chr useradd -m -G wheel -s /bin/bash "$user_name" || die "failed to create user $user_name"
+    $chr passwd -q "$user_name" || $chr passwd "$user_name"
+    if [ -f /mnt/etc/sudoers ]; then
+        sed -i 's/^# \(%wheel ALL=(ALL:ALL) ALL\)/\1/' /mnt/etc/sudoers >/dev/null 2>&1 || true
+        sed -i 's/^# \(%wheel ALL=(ALL) ALL\)/\1/' /mnt/etc/sudoers >/dev/null 2>&1 || true
+    fi
+}
+
+ensure_prtdir_line() {
+    dir=$1
+    if ! grep -q "^prtdir $dir$" /mnt/etc/prt-get.conf 2>/dev/null; then
+        printf '\nprtdir %s\n' "$dir" >> /mnt/etc/prt-get.conf
+    fi
+}
+
+write_rsync_repo() {
+    name=$1
+    host=$2
+    collection=$3
+    destination=$4
+    cat > "/mnt/etc/ports/${name}.rsync" <<EOF2
+# /etc/ports/${name}.rsync
+host=${host}
+collection=${collection}
+destination=${destination}
+# End of file
+EOF2
+}
+
+write_httpup_repo() {
+    name=$1
+    root_dir=$2
+    url=$3
+    cat > "/mnt/etc/ports/${name}.httpup" <<EOF2
+# /etc/ports/${name}.httpup
+ROOT_DIR=${root_dir}
+URL=${url}
+# End of file
+EOF2
+}
+
+enable_contrib_repo() {
+    if [ -f /mnt/etc/ports/contrib.rsync.inactive ] && [ ! -f /mnt/etc/ports/contrib.rsync ]; then
+        mv /mnt/etc/ports/contrib.rsync.inactive /mnt/etc/ports/contrib.rsync
+    fi
+    ensure_prtdir_line /usr/ports/contrib
+}
+
+enable_kde_repo() {
+    write_rsync_repo kde-plasma-6 crux.nu ports/kde-plasma-6/3.8/ /usr/ports/kde-plasma-6
+    ensure_prtdir_line /usr/ports/kde-plasma-6
+}
+
+enable_xfce_repo() {
+    write_httpup_repo xfce4 /usr/ports/xfce4 https://codeberg.org/jlngn/xfce4/raw/branch/3.8
+    ensure_prtdir_line /usr/ports/xfce4
+}
+
+configure_pkgmk_cache() {
+    mkdir -p /mnt/var/cache/pkgmk/distfiles /mnt/var/cache/pkgmk/packages /mnt/var/cache/pkgmk/work
+    if grep -q '^PKGMK_SOURCE_DIR=' /mnt/etc/pkgmk.conf 2>/dev/null; then
+        sed -i 's|^PKGMK_SOURCE_DIR=.*|PKGMK_SOURCE_DIR="/var/cache/pkgmk/distfiles"|' /mnt/etc/pkgmk.conf
+    else
+        printf 'PKGMK_SOURCE_DIR="/var/cache/pkgmk/distfiles"\n' >> /mnt/etc/pkgmk.conf
+    fi
+    if grep -q '^PKGMK_PACKAGE_DIR=' /mnt/etc/pkgmk.conf 2>/dev/null; then
+        sed -i 's|^PKGMK_PACKAGE_DIR=.*|PKGMK_PACKAGE_DIR="/var/cache/pkgmk/packages"|' /mnt/etc/pkgmk.conf
+    else
+        printf 'PKGMK_PACKAGE_DIR="/var/cache/pkgmk/packages"\n' >> /mnt/etc/pkgmk.conf
+    fi
+    if grep -q '^PKGMK_WORK_DIR=' /mnt/etc/pkgmk.conf 2>/dev/null; then
+        sed -i 's|^PKGMK_WORK_DIR=.*|PKGMK_WORK_DIR="/var/cache/pkgmk/work/$name"|' /mnt/etc/pkgmk.conf
+    else
+        printf 'PKGMK_WORK_DIR="/var/cache/pkgmk/work/$name"\n' >> /mnt/etc/pkgmk.conf
+    fi
+}
+
+sync_ports_tree() {
+    echo "Syncing ports trees..."
+    $chr /bin/sh -c 'ports -u' || die "ports -u failed"
+}
+
+install_port_group() {
+    pkgs=$1
+    echo "Installing ports: $pkgs"
+    $chr /bin/sh -c "prt-get --install-scripts depinst $pkgs" || die "port installation failed"
+}
+
+setup_desktop_session_files() {
+    [ -n "$desktop_session_cmd" ] || return 0
+    user_home="/mnt/home/$user_name"
+    [ -d "$user_home" ] || return 0
+
+    printf '%s\n' "$desktop_session_cmd" > "$user_home/.xsession"
+    printf '%s\n' "$desktop_session_cmd" > "$user_home/.xinitrc"
+    chown "$user_name:$user_name" "$user_home/.xsession" "$user_home/.xinitrc" 2>/dev/null || true
+    chmod 644 "$user_home/.xsession" "$user_home/.xinitrc" 2>/dev/null || true
+}
+
+write_postinstall_notes() {
+    notes=/mnt/root/POSTINSTALL.txt
+    {
+        echo "CRUX $version post-install notes"
+        echo ""
+        echo "Hostname: $hostn"
+        echo "Root filesystem: $fs"
+        [ -n "$desktop_label" ] && echo "Desktop installed: $desktop_label"
+        [ "$desktop_dm" = "xdm" ] && echo "Graphical login: enabled via xdm"
+        echo ""
+        if [ -n "$desktop_label" ]; then
+            echo "Desktop startup:"
+            if [ "$desktop_dm" = "xdm" ]; then
+                echo "  - Reboot and log in graphically using xdm."
+            else
+                case "$desktop_choice" in
+                    kde) echo "  - From a console, log in as your user and run: startplasma-x11" ;;
+                    xfce) echo "  - From a console, log in as your user and run: startxfce4" ;;
+                esac
+            fi
+            echo "  - A matching ~/.xsession and ~/.xinitrc were created for user '$user_name'."
+            echo ""
+        fi
+        echo "Useful reminders:"
+        echo "  - Check /etc/rc.conf and /etc/fstab before first reboot if you changed your mind mid-install."
+        echo "  - If Flatpak was installed, Flathub may already be configured system-wide."
+    } > "$notes"
+}
+
+desktop_cfg() {
+    desktop_choice=$(ask_optional "Desktop environment: (N)one, (K)DE Plasma 6, or (X)fce" "n")
+    desktop_choice=$(printf '%s' "$desktop_choice" | tr '[:upper:]' '[:lower:]')
+    desktop_pkgs=''
+    desktop_session_cmd=''
+    desktop_label=''
+    desktop_dm=''
+    desktop_extra_services=''
+
+    case "$desktop_choice" in
+        k|kde|plasma|plasma6)
+            desktop_choice=kde
+            desktop_label='KDE Plasma 6'
+            enable_kde_repo
+            desktop_pkgs='xorg-server xorg-xinit xorg-xf86-input-libinput mesa plasma-meta dolphin ark kate gwenview okular discover partitionmanager plasma-nm plasma-pa ocean-sound-theme'
+            desktop_session_cmd='exec startplasma-x11'
+            ;;
+        x|xfce|xfce4)
+            desktop_choice=xfce
+            desktop_label='Xfce'
+            enable_xfce_repo
+            desktop_pkgs='xorg-server xorg-xinit xorg-xf86-input-libinput mesa xfce4 thunar-archive-plugin thunar-volman tumbler mousepad ristretto parole xarchiver xfce4-screenshooter xfce4-pulseaudio-plugin xfce4-notifyd'
+            desktop_session_cmd='exec startxfce4'
+            ;;
+        *)
+            desktop_choice=''
+            return 0
+            ;;
+    esac
+
+    configure_pkgmk_cache
+    sync_ports_tree
+
+    if confirm_yes "Install XDM too for an easy graphical login?" "y"; then
+        desktop_pkgs="$desktop_pkgs xorg-xdm"
+        desktop_dm='xdm'
+        desktop_extra_services='xdm'
+    fi
+
+    install_port_group "$desktop_pkgs"
+    setup_desktop_session_files
+    write_postinstall_notes
+}
+
+etc_cfg() {
+    root_uuid=$(blk_uuid "$rdiskr")
+    swap_uuid=''
+    boot_uuid=''
+    home_uuid=''
+    [ -n "${sw:-}" ] && swap_uuid=$(blk_uuid "$sw")
+    [ -n "${boot:-}" ] && boot_uuid=$(blk_uuid "$boot")
+    [ -n "${home:-}" ] && home_uuid=$(blk_uuid "$home")
+
+    {
+        [ -n "$root_uuid" ] && printf 'UUID=%s / %s defaults 0 1\n' "$root_uuid" "$fs" || printf '%s / %s defaults 0 1\n' "$rdiskr" "$fs"
+        [ -n "$boot" ] && [ -n "$boot_uuid" ] && printf 'UUID=%s /boot vfat defaults 0 2\n' "$boot_uuid"
+        [ -n "${home:-}" ] && [ -n "$home_uuid" ] && printf 'UUID=%s /home %s defaults 0 2\n' "$home_uuid" "$fs"
+        [ -n "${sw:-}" ] && [ -n "$swap_uuid" ] && printf 'UUID=%s swap swap defaults 0 0\n' "$swap_uuid"
+        printf 'devpts /dev/pts devpts noexec,nosuid,gid=tty,mode=0620 0 0\n'
+        printf 'shm /dev/shm tmpfs defaults 0 0\n'
+    } > /mnt/etc/fstab
+
+    cat > /mnt/etc/hosts <<EOF2
+127.0.0.1 localhost
+127.0.1.1 $hostn.localdomain $hostn
+EOF2
+
+    if [ -n "${ns1:-}" ]; then
+        if [ -n "${ns2:-}" ]; then
+            cat > /mnt/etc/resolv.conf <<EOF2
 nameserver $ns1
 nameserver $ns2
-EOF
-		else
-			cat >/mnt/etc/resolv.conf <<EOF
+EOF2
+        else
+            cat > /mnt/etc/resolv.conf <<EOF2
 nameserver $ns1
-EOF
-		fi
-	fi
+EOF2
+        fi
+    fi
 
-	cat >/mnt/etc/rc.conf <<EOF
+    services_list='lo crond sshd'
+    [ -n "$nic_conf" ] && services_list="lo net crond sshd"
+    [ -n "$desktop_extra_services" ] && services_list="$services_list $desktop_extra_services"
+
+    cat > /mnt/etc/rc.conf <<EOF2
 #
 # /etc/rc.conf: system configuration
 #
@@ -394,204 +595,194 @@ KEYMAP=us
 TIMEZONE=$tzone
 HOSTNAME=$hostn
 SYSLOG=sysklogd
-SERVICES=(lo net crond sshd)
+SERVICES=($services_list)
 
 # End of file
-EOF
+EOF2
 
-	if [ ! $gw2 = '' ]; then
-		sed -i -e 's/="DHCP"/="static"/'		\
-			-e "s/DEV=.*/DEV=$nic_conf/"		\
-			-e "s/ADDR=.*/ADDR=$ip/" 		\
-			-e "s/MASK=.*/MASK=$subnet_mask/"	\
-			-e "s/GW=.*/GW=$gw2/" /mnt/etc/rc.d/net
-	fi
+    if [ -n "$nic_conf" ] && [ -f /mnt/etc/rc.d/net ]; then
+        if [ "$ip" = "dhcp" ]; then
+            sed -i \
+                -e 's/^TYPE=.*/TYPE="DHCP"/' \
+                -e "s/^DEV=.*/DEV=$nic_conf/" \
+                -e "s|^DHCPOPTS=.*|DHCPOPTS=\"$nic_conf -h \\`/bin/hostname\\` -t 10\"|" \
+                /mnt/etc/rc.d/net >/dev/null 2>&1 || true
+        else
+            sed -i \
+                -e 's/^TYPE=.*/TYPE="static"/' \
+                -e "s/^DEV=.*/DEV=$nic_conf/" \
+                -e "s/^ADDR=.*/ADDR=$ip/" \
+                -e "s/^MASK=.*/MASK=$subnet_mask/" \
+                -e "s/^GW=.*/GW=$gw2/" \
+                /mnt/etc/rc.d/net >/dev/null 2>&1 || true
+        fi
+    fi
 }
 
-upgrade_kernel() {
-	merge
-	echo -n "Upgrade kernel? [n] "
-	read resp 
-	case $resp in
-	[Yy])
-		kernel
-		;;
-	*)
-		resp=n
-		;;
-	esac
+upgrade() {
+    disk
+    diskn
+    if is_uefi; then
+        root_guess=$(partdev 3)
+    else
+        root_guess=$(partdev 2)
+    fi
+    rdiskr=$(ask_optional "Which partition is the root?" "$root_guess")
+    mount "$rdiskr" /mnt || die "failed to mount root partition"
+    if is_uefi; then
+        boot_guess=$(partdev 1)
+        if [ -b "$boot_guess" ]; then
+            mkdir -p /mnt/boot
+            mount "$boot_guess" /mnt/boot >/dev/null 2>&1 || true
+            boot=$boot_guess
+        fi
+    fi
+    /usr/bin/setup || die "official CRUX setup failed"
+    mount_bindings
+    if confirm_yes "Do you want to rebuild or replace the kernel?" "n"; then
+        kernel_cfg
+    fi
+    if confirm_yes "Do you want to reinstall GRUB?" "y"; then
+        bootloader_cfg
+    fi
+    end
 }
 
-kernel() {
-	echo ""
-	echo "Configuring kernel."
-	echo -n "Build your own kernel? [y] "
-	read resp
-	case $resp in
-	[Yy])
-		build_kernel
-		;;
-	[Nn])
-		download_kernel
-		;;
-	*)
-		build_kernel
-		;;
-	esac
-}
-
-download_kernel() {
-	echo -n "Copy kernel image from? (ssh) [user@example.org] "
-	read download
-
-	backup_kernel
-	scp ${download}:/boot/{vmlinuz*,System.map*} /mnt/boot &&
-		echo "Downloading kernel modules... " &&
-		ssh $download 'cd / && tar zcf - lib/modules/*' |
-		(cd /mnt && tar zxf -)
-
-	if [ ! $? = 0 ]; then
-		echo "Download failed."
-		echo "Falling back to building a custom kernel."
-		build_kernel
-	fi
-	bootloader
-}
-
-backup_kernel() {
-	if [ -f /mnt/boot/vmlinuz ]; then
-		cp /mnt/boot/vmlinuz /mnt/boot/vmlinuz.old
-		cp /mnt/boot/System.map /mnt/boot/System.map.old
-	fi
+kernel_cfg() {
+    echo ""
+    echo "Configuring kernel."
+    if confirm_yes "Build your own kernel?" "y"; then
+        build_kernel
+    else
+        echo "The CRUX 3.8 handbook expects you to either build a kernel or copy one in manually."
+        echo "Falling back to building a local kernel because that is the least cursed option."
+        build_kernel
+    fi
 }
 
 untar_kernel() {
-	echo -n "Copying and uncompressing kernel tarball... "
-	tar -C $src -xJf $kernel
-	cp -f $crux/kernel/linux-$kernel_version.defconfig \
-		$src/linux-$kernel_version/.config
-	chown -R root.root $src/linux-$kernel_version
-	chmod -R go-w $src/linux-$kernel_version
-	if [ -f $crux/kernel/*patch ]; then
-		for patch in $crux/kernel/*patch; do
-			patch -sd $src/linux-$kernel_version -p1 < $patch
-			cp $patch $src
-		done
-	fi
-	if [ ! -d /mnt/lib/modules/$kernel_version ]; then
-		mkdir -p /mnt/lib/modules/$kernel_version
-		depmod -b /mnt -a $kernel_version >/dev/null 2>&1
-	fi
+    crux=/media/crux
+    src=/mnt/usr/src
+    kernel=$(find "$crux/kernel" -maxdepth 1 -type f -name 'linux-*.tar.xz' | sort | tail -n 1)
+    [ -n "$kernel" ] || die "could not find a kernel tarball on the ISO"
+    kernel_version=$(basename "$kernel" .tar.xz | sed 's/^linux-//')
+
+    echo -n "Copying and unpacking kernel tarball... "
+    tar -C "$src" -xJf "$kernel" || die "failed to unpack kernel tarball"
+    if [ -f "$crux/kernel/linux-$kernel_version.defconfig" ]; then
+        cp -f "$crux/kernel/linux-$kernel_version.defconfig" "$src/linux-$kernel_version/.config"
+    fi
+    if [ -f "$crux/kernel/contrib/config-$kernel_version-modular" ] && confirm_yes "Use the provided modular example config?" "n"; then
+        cp -f "$crux/kernel/contrib/config-$kernel_version-modular" "$src/linux-$kernel_version/.config"
+    fi
+    chown -R root:root "$src/linux-$kernel_version"
+    chmod -R go-w "$src/linux-$kernel_version"
+    echo "done"
 }
 
 build_kernel() {
-	export DIR=usr/src/linux-*
-	kernel=$crux/kernel/linux-*.tar.xz
-	kernel_version=`basename $kernel .tar.xz | sed "s/linux-//"`
+    untar_kernel
+    DIR="usr/src/linux-$kernel_version"
+    cpus=$(nproc 2>/dev/null)
+    case "$cpus" in
+        ''|*[!0-9]*) cpus=1 ;;
+    esac
+    cpus=$((cpus + 1))
 
-	if [ $k = 0 ]; then
-		untar_kernel
-	fi
+    if confirm_yes "Open menuconfig before build?" "y"; then
+        $chr /bin/bash -c "cd /$DIR && make menuconfig" || die "menuconfig failed"
+    fi
 
-	echo ""
-	echo -n "Download custom .config? [n] " 
-	read resp
-	case $resp in
-	[Yy])
-		echo -n "Location of .config?  ('http://example.org/.config' "
-		echo -n "or (ssh) 'user@example.org:/tmp/.config') "
-		read config
-		case $config in
-		[http]*)
-			wget --no-ch -q $config
-			cp .config $src/linux-$kernel_version
-			;;
-		[ftp]*)
-			wget --no-ch -q $config
-			cp .config $src/linux-$kernel_version
-			;;
-		*)
-			scp $config $src/linux-$kernel_version
-			;;
-		esac
-		;;
-	*)
-		resp=n
-		;;
-	esac
+    $chr /bin/bash -c "cd /$DIR && make -j $cpus all" || die "kernel build failed"
+    $chr /bin/bash -c "cd /$DIR && make modules_install" || die "module install failed"
 
-	cpus=$((`nproc`+1))
-	$chr /bin/bash -c "cd /$DIR && make menuconfig"
-	$chr /bin/bash -c "cd /$DIR && make -j $cpus all"
-	$chr /bin/bash -c "cd /$DIR && make modules_install"
+    cp "/mnt/$DIR/arch/x86/boot/bzImage" /mnt/boot/vmlinuz || die "failed to copy kernel image"
+    cp "/mnt/$DIR/System.map" /mnt/boot/System.map || die "failed to copy System.map"
+    $chr /bin/bash -c "cd /$DIR && make clean" >/dev/null 2>&1 || true
 
-	backup_kernel
-	cp /mnt/$DIR/arch/x86/boot/bzImage /mnt/boot/vmlinuz
-	cp /mnt/$DIR/System.map /mnt/boot
-	$chr /bin/bash -c "cd /$DIR && make clean"
-	bootloader
+    bootloader_cfg
 }
 
-bootloader() {
-	if [ -f /mnt/etc/lilo.conf ]; then
-		cp /mnt/etc/lilo.conf /mnt/etc/lilo.conf.old
-	fi
+bootloader_cfg() {
+    install_bootloader_pkgs
 
-	if [ -f /mnt/boot/vmlinuz.old ]; then
-		if [ ! `grep prompt /mnt/etc/lilo.conf` ]; then
-			sed -i '4s/^/\nprompt\ntimeout=50/' /mnt/etc/lilo.conf
-			cat >>/mnt/etc/lilo.conf <<EOF
-image=/boot/vmlinuz.old
-	label=CRUX.old
-	read-only
-	root=/dev/$rdiskr
-EOF
-		fi
-	else
-		cat >/mnt/etc/lilo.conf <<EOF
-#
-# /etc/lilo.conf: lilo(8) configuration, see lilo.conf(5)
-#
+    if [ ! -x /mnt/usr/sbin/grub-install ] && [ ! -x /mnt/usr/bin/grub-install ]; then
+        warn "grub-install was not found inside the target system. Make sure grub2/grub2-efi was selected in /usr/bin/setup or present on the ISO."
+        return 1
+    fi
 
-lba32
-compact
-install=text
-boot=/dev/$rdisk
-image=/boot/vmlinuz
-	label=CRUX
-	read-only
-	root=/dev/$rdiskr
-EOF
-	fi
+    if [ ! -f /mnt/etc/default/grub ]; then
+        cat > /mnt/etc/default/grub <<EOF2
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR=CRUX
+GRUB_CMDLINE_LINUX_DEFAULT="loglevel=4"
+EOF2
+    fi
 
-	if [ ! -f /mnt/boot/vmlinuz ]; then
-		$chr ln -s /boot/vmlinuz* /boot/vmlinuz
-	fi
-
-	$chr /sbin/lilo >/dev/null 2>&1
+    if is_uefi; then
+        [ -d /mnt/boot ] || die "EFI partition is not mounted at /mnt/boot"
+        $chr /bin/sh -c 'grub-install /boot' || die "grub-install failed in UEFI mode"
+    else
+        $chr /bin/sh -c "grub-install /dev/$rdisk" || die "grub-install failed in BIOS mode"
+    fi
+    $chr /bin/sh -c 'grub-mkconfig -o /boot/grub/grub.cfg' || die "grub-mkconfig failed"
 }
 
-merge() {
-	$chr rejmerge
+flatpak_cfg() {
+    if ! confirm_yes "Preinstall Flatpak from contrib and add Flathub?" "y"; then
+        return 0
+    fi
+
+    enable_contrib_repo
+    configure_pkgmk_cache
+    sync_ports_tree
+
+    flatpak_pkgs='fakeroot flatpak xdg-desktop-portal xdg-desktop-portal-gtk xdg-utils xdg-user-dirs'
+    install_port_group "$flatpak_pkgs"
+
+    if confirm_yes "Try to add the Flathub system remote now?" "y"; then
+        $chr /bin/sh -c 'flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo' || \
+            warn "failed to add the Flathub remote"
+    fi
+}
+
+install() {
+    hostname_cfg
+    network_cfg
+    timezone_cfg
+    disk
+    diskn
+    pdisk
+    setup_packages
+    mount_bindings
+    password_cfg
+    user_cfg
+    desktop_cfg
+    etc_cfg
+    kernel_cfg
+    flatpak_cfg
+    write_postinstall_notes
+    end
 }
 
 end() {
-	echo ""
-	echo "Your CRUX system is ready.  Please reboot."
-	echo -n "Exit to (S)hell, (H)alt, or (R)eboot? [r] "
-	read resp
-	case $resp in
-	[Ss])
-		echo "Your root is mounted at /mnt."
-		exit
-		;;
-	[Hh])
-		/sbin/shutdown -Ph now
-		;;
-	*)
-		/sbin/reboot
-		;;
-	esac
+    echo ""
+    echo "Your CRUX system should now be ready. Please review any warnings above before rebooting."
+    printf "Exit to (S)hell, (H)alt, or (R)eboot? [r] "
+    read resp
+    case "$resp" in
+        [Ss])
+            echo "Your target root is mounted at /mnt."
+            exit 0
+            ;;
+        [Hh])
+            /sbin/shutdown -Ph now
+            ;;
+        *)
+            /sbin/reboot
+            ;;
+    esac
 }
 
 main
