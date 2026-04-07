@@ -19,7 +19,7 @@ support with flathub, improved partitioning, and updated CRUX 3.8 compatibility.
 
 (3) Download install script
 
-    # curl -LO https://raw.githubusercontent.com/akosela/crux-install/master/install
+    # curl -LO https://raw.githubusercontent.com/RobertFlexx/crux-install/master/install
 
     (wget may not work in some environments, curl is recommended)
 
