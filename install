@@ -6,7 +6,7 @@
 # found in the LICENSE file.
 
 
-VERSION="3.8-enhanced-2.0"
+VERSION="3.8-easy-3.0"
 CRUX_RELEASE="3.8"
 TARGET="/mnt"
 MEDIA="/media/crux"
@@ -49,6 +49,23 @@ services_list=""
 bindings_mounted="no"
 keep_mounts="no"
 install_mode="fresh"
+
+# Guided-install state.
+FS_RESULT=""
+SELECTED_BLOCK=""
+selected_gpu="auto"
+detected_gpu="generic"
+display_manager="xdm"
+enable_alan_sddm="no"
+install_bluetooth="no"
+install_printing="no"
+install_firmware="yes"
+install_discover="yes"
+install_gaming32="no"
+base_install_method="automatic"
+advanced_repositories="no"
+nvidia_proprietary_modules="0"
+enable_sshd="ask"
 
 say() {
     printf '%s\n' "$*"
@@ -140,6 +157,47 @@ choose_number() {
                 ;;
         esac
     done
+}
+
+
+choose_from_file() {
+    list_file=$1
+    prompt=$2
+    default=$3
+    [ -s "$list_file" ] || return 1
+    count=$(wc -l < "$list_file" | awk '{print $1}')
+    valid_uint "$count" || return 1
+    [ "$count" -gt 0 ] || return 1
+    choice=$(choose_number "$prompt" "$default" 1 "$count")
+    SELECTED_LINE=$(sed -n "${choice}p" "$list_file")
+    [ -n "$SELECTED_LINE" ]
+}
+
+is_partition_mounted() {
+    dev=$1
+    if have lsblk; then
+        lsblk -nr -o MOUNTPOINTS "$dev" 2>/dev/null | grep -q '[^[:space:]]'
+    else
+        grep -q "^${dev}[[:space:]]" /proc/mounts 2>/dev/null
+    fi
+}
+
+partition_is_swap_active() {
+    dev=$1
+    have swapon || return 1
+    swapon --noheadings --show=NAME 2>/dev/null | grep -Fqx "$dev"
+}
+
+block_summary() {
+    dev=$1
+    size=$(lsblk -dn -o SIZE "$dev" 2>/dev/null | awk '{$1=$1;print}')
+    fstype=$(blk_value TYPE "$dev")
+    label=$(blk_value LABEL "$dev")
+    partlabel=$(lsblk -dn -o PARTLABEL "$dev" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    mounts=$(lsblk -nr -o MOUNTPOINTS "$dev" 2>/dev/null | paste -sd ',' - | sed 's/^[, ]*//;s/[, ]*$//')
+    printf '%s  size=%s  fs=%s  label=%s  partlabel=%s%s\n' \
+        "$dev" "${size:-?}" "${fstype:-none}" "${label:-none}" "${partlabel:-none}" \
+        "${mounts:+  mounted=$mounts}"
 }
 
 have() {
@@ -284,14 +342,14 @@ service_exists() {
 show_banner() {
     cat <<EOF
 
-CRUX $CRUX_RELEASE Enhanced Installer $VERSION
-===============================================
-This helper uses the official CRUX setup utility for the base system, then
-adds safer partitioning, repository setup, optional desktops, and clearer
-post-install guidance.
+CRUX $CRUX_RELEASE Easy Installer $VERSION
+===========================================
+This installer can erase a whole disk or reuse partitions, installs the CRUX
+base system, builds a bootable kernel, configures GRUB, and can prepare a full
+KDE Plasma desktop with networking, audio, Flatpak/Flathub, and GPU drivers.
 
-IMPORTANT: automatic partitioning destroys the selected disk. Read every
-summary before confirming it. The installer log is written to $LOGFILE.
+IMPORTANT: formatting or automatic partitioning destroys data. Every destructive
+step has a summary and a typed confirmation. Log: $LOGFILE
 EOF
 }
 
@@ -299,11 +357,12 @@ show_help() {
     cat <<EOF
 Usage: ${0##*/} [OPTION]
 
-  --install     start a fresh installation
-  --upgrade     mount an installed CRUX system and run the ISO upgrade path
-  --shell       exit immediately to the installation shell
-  --version     print version information
-  --help        show this help
+  --install       start a guided fresh installation
+  --upgrade       mount an installed CRUX system and run the upgrade path
+  --self-test     run non-destructive parser and mapping tests
+  --shell         exit immediately to the installation shell
+  --version       print version information
+  --help          show this help
 
 Without an option, an interactive menu is shown.
 EOF
@@ -345,6 +404,70 @@ network_interfaces() {
     fi
 }
 
+zone_table() {
+    if [ -r /usr/share/zoneinfo/zone1970.tab ]; then
+        printf '%s\n' /usr/share/zoneinfo/zone1970.tab
+    elif [ -r /usr/share/zoneinfo/zone.tab ]; then
+        printf '%s\n' /usr/share/zoneinfo/zone.tab
+    else
+        return 1
+    fi
+}
+
+validate_timezone() {
+    zone=$1
+    [ "$zone" = "UTC" ] || [ -e "/usr/share/zoneinfo/$zone" ]
+}
+
+browse_timezones() {
+    table=$(zone_table) || return 1
+    regions=$(mktemp /tmp/crux-regions.XXXXXX) || return 1
+    zones=$(mktemp /tmp/crux-zones.XXXXXX) || { rm -f "$regions"; return 1; }
+    awk -F '\t' '!/^#/ && NF >= 3 {split($3,a,"/"); print a[1]}' "$table" | sort -u > "$regions"
+    say ""
+    nl -ba -w2 -s') ' "$regions"
+    choose_from_file "$regions" "Timezone region" "1" || { rm -f "$regions" "$zones"; return 1; }
+    region=$SELECTED_LINE
+    awk -F '\t' -v r="$region/" '!/^#/ && NF >= 3 && index($3,r)==1 {print $3}' "$table" | sort -u > "$zones"
+    [ -s "$zones" ] || { rm -f "$regions" "$zones"; return 1; }
+    say ""
+    nl -ba -w3 -s') ' "$zones"
+    choose_from_file "$zones" "Timezone" "1" || { rm -f "$regions" "$zones"; return 1; }
+    tzone=$SELECTED_LINE
+    rm -f "$regions" "$zones"
+    return 0
+}
+
+choose_timezone() {
+    while :; do
+        say ""
+        say "Timezone"
+        say "--------"
+        say "  1) UTC"
+        say "  2) America/Los_Angeles (Pacific)"
+        say "  3) America/Denver      (Mountain)"
+        say "  4) America/Chicago     (Central)"
+        say "  5) America/New_York    (Eastern)"
+        say "  6) Browse every installed timezone"
+        say "  7) Type an Area/City name"
+        tz_choice=$(choose_number "Choose timezone" "2" 1 7)
+        case "$tz_choice" in
+            1) tzone=UTC ;;
+            2) tzone=America/Los_Angeles ;;
+            3) tzone=America/Denver ;;
+            4) tzone=America/Chicago ;;
+            5) tzone=America/New_York ;;
+            6) browse_timezones || warn "could not read the timezone database" ;;
+            7) tzone=$(ask "Timezone (Area/City)" "UTC") ;;
+        esac
+        if validate_timezone "$tzone"; then
+            info "selected timezone $tzone"
+            return 0
+        fi
+        warn "timezone '$tzone' does not exist under /usr/share/zoneinfo"
+    done
+}
+
 configure_identity() {
     while :; do
         hostn=$(ask "System hostname" "crux")
@@ -352,13 +475,7 @@ configure_identity() {
         warn "use letters, digits, dots, and hyphens; labels cannot begin or end with a hyphen"
     done
 
-    while :; do
-        tzone=$(ask "Timezone (for example America/Los_Angeles)" "UTC")
-        if [ "$tzone" = "UTC" ] || [ -e "/usr/share/zoneinfo/$tzone" ]; then
-            break
-        fi
-        warn "timezone '$tzone' was not found under /usr/share/zoneinfo"
-    done
+    choose_timezone
 
     keymap=$(ask "Console keymap" "us")
     locale_name=$(ask "System locale" "C.UTF-8")
@@ -443,43 +560,61 @@ configure_install_network() {
 }
 
 list_disks() {
+    disk_file=$1
+    : > "$disk_file"
     say ""
-    say "Available disks"
-    say "---------------"
+    say "Available install disks"
+    say "-----------------------"
     if have lsblk; then
-        lsblk -d -n -p -o NAME,SIZE,MODEL,TRAN,TYPE 2>/dev/null |
-            awk '$5 == "disk" {printf "  %-16s %-9s %-26s %s\n", $1, $2, $3, $4}'
+        lsblk -dn -p -o NAME,TYPE,RO 2>/dev/null | awk '$2 == "disk" && $3 == 0 {print $1}' > "$disk_file"
     else
-        fdisk -l 2>/dev/null | awk '/^Disk \/dev\// {print "  " $2 " " $3 " " $4}'
+        fdisk -l 2>/dev/null | awk '/^Disk \/dev\// {sub(":", "", $2); print $2}' > "$disk_file"
     fi
+    n=1
+    while IFS= read -r dev; do
+        [ -n "$dev" ] || continue
+        size=$(lsblk -dn -o SIZE "$dev" 2>/dev/null | awk '{$1=$1;print}')
+        model=$(lsblk -dn -o MODEL "$dev" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        tran=$(lsblk -dn -o TRAN "$dev" 2>/dev/null | awk '{$1=$1;print}')
+        printf '  %d) %-16s %-9s %-8s %s\n' "$n" "$dev" "${size:-?}" "${tran:-?}" "${model:-unknown}"
+        n=$((n + 1))
+    done < "$disk_file"
 }
 
 first_disk() {
-    if have lsblk; then
-        lsblk -d -n -p -o NAME,TYPE 2>/dev/null | awk '$2 == "disk" {print $1; exit}'
-    else
-        fdisk -l 2>/dev/null | awk '/^Disk \/dev\// {sub(":", "", $2); print $2; exit}'
-    fi
+    tmp=$(mktemp /tmp/crux-disks.XXXXXX) || return 1
+    list_disks "$tmp" >/dev/null
+    sed -n '1p' "$tmp"
+    rm -f "$tmp"
 }
 
 select_disk() {
-    require_commands sfdisk wipefs
+    require_commands sfdisk wipefs lsblk
     while :; do
-        list_disks
-        default_disk=$(first_disk)
-        [ -n "$default_disk" ] || die "no target disks were detected"
-        rdisk=$(ask "Target disk ('?' shows full block layout)" "$default_disk")
-        if [ "$rdisk" = "?" ]; then
-            lsblk -o NAME,SIZE,FSTYPE,TYPE,MOUNTPOINTS,MODEL 2>/dev/null || true
+        disks=$(mktemp /tmp/crux-disks.XXXXXX) || die "cannot create disk list"
+        list_disks "$disks"
+        [ -s "$disks" ] || { rm -f "$disks"; die "no writable whole disks were detected"; }
+        say ""
+        say "Type '?' at the prompt only if you need the full lsblk view."
+        count=$(wc -l < "$disks" | awk '{print $1}')
+        disk_choice=$(ask "Disk number, or ?" "1")
+        if [ "$disk_choice" = "?" ]; then
+            lsblk -o NAME,SIZE,FSTYPE,FSVER,LABEL,PARTLABEL,PARTTYPE,TYPE,MOUNTPOINTS,MODEL 2>/dev/null || true
+            rm -f "$disks"
             pause
             continue
         fi
-        case "$rdisk" in /dev/*) ;; *) rdisk="/dev/$rdisk" ;; esac
-        if ! is_whole_disk "$rdisk"; then
-            warn "'$rdisk' is not a whole-disk block device"
-            continue
-        fi
-        break
+        case "$disk_choice" in ''|*[!0-9]*) warn "enter a listed disk number"; rm -f "$disks"; continue ;; esac
+        [ "$disk_choice" -ge 1 ] 2>/dev/null && [ "$disk_choice" -le "$count" ] 2>/dev/null || {
+            warn "enter a number from 1 to $count"; rm -f "$disks"; continue;
+        }
+        rdisk=$(sed -n "${disk_choice}p" "$disks")
+        rm -f "$disks"
+        is_whole_disk "$rdisk" || { warn "'$rdisk' is not a whole-disk block device"; continue; }
+        say ""
+        say "Selected disk:"
+        lsblk -o NAME,SIZE,FSTYPE,LABEL,PARTLABEL,TYPE,MOUNTPOINTS,MODEL "$rdisk" 2>/dev/null || true
+        confirm "Use $rdisk as the installation disk?" "y" && break
     done
 }
 
@@ -523,35 +658,37 @@ wait_for_block() {
 filesystem_menu() {
     purpose=$1
     default=$2
-    say ""
-    say "Filesystem for $purpose"
-    say "  1) ext4   - conservative default"
-    say "  2) btrfs  - snapshots and checksums"
-    say "  3) xfs    - high-performance general purpose"
-    say "  4) jfs    - lightweight journaling filesystem"
-    say "  5) ext3"
-    say "  6) ext2"
-    case "$default" in
-        btrfs) d=2 ;; xfs) d=3 ;; jfs) d=4 ;; ext3) d=5 ;; ext2) d=6 ;; *) d=1 ;;
-    esac
-    fchoice=$(choose_number "Choose filesystem" "$d" 1 6)
-    case "$fchoice" in
-        1) selected_fs=ext4 ;;
-        2) selected_fs=btrfs ;;
-        3) selected_fs=xfs ;;
-        4) selected_fs=jfs ;;
-        5) selected_fs=ext3 ;;
-        6) selected_fs=ext2 ;;
-    esac
-
-    case "$selected_fs" in
-        btrfs) mkfs_cmd=mkfs.btrfs ;;
-        xfs) mkfs_cmd=mkfs.xfs ;;
-        jfs) mkfs_cmd=mkfs.jfs ;;
-        *) mkfs_cmd="mkfs.$selected_fs" ;;
-    esac
-    have "$mkfs_cmd" || die "$mkfs_cmd is not available in the installer environment"
-    printf '%s' "$selected_fs"
+    while :; do
+        say ""
+        say "Filesystem for $purpose"
+        say "--------------------------"
+        say "  1) ext4   - recommended; simple, mature, and easy to repair"
+        say "  2) btrfs  - checksums and snapshots"
+        say "  3) xfs    - strong choice for large files and throughput"
+        say "  4) jfs    - advanced/legacy choice"
+        say "  5) ext3   - legacy compatibility"
+        say "  6) ext2   - no journal; generally not recommended"
+        case "$default" in btrfs) d=2 ;; xfs) d=3 ;; jfs) d=4 ;; ext3) d=5 ;; ext2) d=6 ;; *) d=1 ;; esac
+        fchoice=$(choose_number "Choose filesystem" "$d" 1 6)
+        case "$fchoice" in
+            1) FS_RESULT=ext4 ;;
+            2) FS_RESULT=btrfs ;;
+            3) FS_RESULT=xfs ;;
+            4) FS_RESULT=jfs ;;
+            5) FS_RESULT=ext3 ;;
+            6) FS_RESULT=ext2 ;;
+        esac
+        case "$FS_RESULT" in
+            btrfs) mkfs_cmd=mkfs.btrfs ;;
+            xfs) mkfs_cmd=mkfs.xfs ;;
+            jfs) mkfs_cmd=mkfs.jfs ;;
+            *) mkfs_cmd="mkfs.$FS_RESULT" ;;
+        esac
+        if have "$mkfs_cmd"; then
+            return 0
+        fi
+        warn "$mkfs_cmd is unavailable on this installer media; choose another filesystem"
+    done
 }
 
 format_filesystem() {
@@ -585,12 +722,14 @@ partition_menu() {
     say ""
     say "Partitioning"
     say "------------"
-    say "  1) Automatic - erase and repartition the whole disk"
-    say "  2) Manual    - open cfdisk and choose existing partitions"
-    pchoice=$(choose_number "Partitioning method" "1" 1 2)
+    say "  1) Automatic: erase and repartition the entire selected disk"
+    say "  2) Guided reuse: choose existing partitions from numbered lists"
+    say "  3) Edit with cfdisk, then choose partitions from numbered lists"
+    pchoice=$(choose_number "Partitioning method" "2" 1 3)
     case "$pchoice" in
         1) automatic_partition ;;
-        2) manual_partition ;;
+        2) manual_partition "no" ;;
+        3) manual_partition "yes" ;;
     esac
 }
 
@@ -614,7 +753,8 @@ automatic_partition() {
         die "a swap partition on $rdisk is active; disable it with swapoff before continuing"
     fi
 
-    root_fs=$(filesystem_menu "the root partition" "ext4")
+    filesystem_menu "the root partition" "ext4"
+    root_fs=$FS_RESULT
     while :; do
         swap_mib=$(ask "Swap size in MiB (0 disables swap)" "2048")
         valid_uint "$swap_mib" && break
@@ -734,32 +874,100 @@ EOF
     home_fs=""
 }
 
+partition_candidates() {
+    lsblk -ln -p -o NAME,TYPE "$rdisk" 2>/dev/null | awk '$2 == "part" {print $1}'
+}
+
+show_partition_choices() {
+    file=$1
+    : > "$file"
+    partition_candidates > "$file"
+    say ""
+    say "Partitions on $rdisk"
+    say "--------------------"
+    n=1
+    while IFS= read -r dev; do
+        printf '  %d) ' "$n"
+        block_summary "$dev"
+        n=$((n + 1))
+    done < "$file"
+}
+
+select_existing_partition() {
+    purpose=$1
+    allow_none=$2
+    parts=$(mktemp /tmp/crux-parts.XXXXXX) || die "cannot create partition list"
+    show_partition_choices "$parts"
+    [ -s "$parts" ] || { rm -f "$parts"; die "no partitions exist on $rdisk"; }
+    count=$(wc -l < "$parts" | awk '{print $1}')
+    if [ "$allow_none" = yes ]; then
+        say "  0) none"
+        choice=$(ask "$purpose partition number" "0")
+        case "$choice" in 0|'') SELECTED_BLOCK=""; rm -f "$parts"; return 0 ;; esac
+    else
+        choice=$(ask "$purpose partition number" "1")
+    fi
+    case "$choice" in ''|*[!0-9]*) rm -f "$parts"; warn "enter a partition number"; return 1 ;; esac
+    [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le "$count" ] 2>/dev/null || {
+        rm -f "$parts"; warn "partition number must be from 1 to $count"; return 1;
+    }
+    SELECTED_BLOCK=$(sed -n "${choice}p" "$parts")
+    rm -f "$parts"
+    validate_block_or_die "$purpose partition" "$SELECTED_BLOCK"
+}
+
+find_esp_candidate() {
+    esp_guid=c12a7328-f81f-11d2-ba4b-00a0c93ec93b
+    for dev in $(partition_candidates); do
+        parttype=$(lsblk -dn -o PARTTYPE "$dev" 2>/dev/null | tr 'A-F' 'a-f' | awk '{$1=$1;print}')
+        fstype=$(blk_value TYPE "$dev")
+        if [ "$parttype" = "$esp_guid" ] || [ "$fstype" = "vfat" ]; then
+            printf '%s\n' "$dev"
+            return 0
+        fi
+    done
+    return 1
+}
+
 manual_partition() {
-    have cfdisk || die "cfdisk is required for manual partitioning"
-    if disk_has_mounts; then
-        warn "some partitions on $rdisk are mounted"
-        show_disk_mounts
-        confirm "Continue without unmounting them?" "n" || die "manual partitioning cancelled"
+    open_editor=${1:-no}
+    if [ "$open_editor" = yes ]; then
+        have cfdisk || die "cfdisk is required for partition-table editing"
+        if disk_has_mounts; then
+            warn "some partitions on $rdisk are mounted"
+            show_disk_mounts
+            confirm "Open cfdisk anyway?" "n" || die "partition editing cancelled"
+        fi
+        info "starting cfdisk for $rdisk"
+        cfdisk "$rdisk" || die "cfdisk exited with an error"
+        have partprobe && partprobe "$rdisk" >/dev/null 2>&1 || true
+        have udevadm && udevadm settle >/dev/null 2>&1 || true
     fi
 
-    info "starting cfdisk for $rdisk"
-    cfdisk "$rdisk" || die "cfdisk exited with an error"
-    have partprobe && partprobe "$rdisk" >/dev/null 2>&1 || true
-    have udevadm && udevadm settle >/dev/null 2>&1 || true
-    say ""
-    lsblk -o NAME,SIZE,FSTYPE,TYPE,MOUNTPOINTS "$rdisk" 2>/dev/null || true
-
-    default_root=$(partdev 3)
-    [ -b "$default_root" ] || default_root=$(partdev 2)
     while :; do
-        rdiskr=$(ask "Root partition" "$default_root")
-        validate_block_or_die "root partition" "$rdiskr"
+        select_existing_partition "Root" no || continue
+        rdiskr=$SELECTED_BLOCK
+        if is_partition_mounted "$rdiskr"; then
+            warn "$rdiskr is mounted; unmount it before using it as root"
+            continue
+        fi
+        if partition_is_swap_active "$rdiskr"; then
+            warn "$rdiskr is active swap; run swapoff first"
+            continue
+        fi
         break
     done
 
     detected_root_fs=$(blk_value TYPE "$rdiskr")
-    if confirm "Format $rdiskr for the new root filesystem?" "y"; then
-        root_fs=$(filesystem_menu "the root partition" "${detected_root_fs:-ext4}")
+    say ""
+    block_summary "$rdiskr"
+    if confirm "FORMAT $rdiskr for the new root filesystem?" "y"; then
+        filesystem_menu "the root partition" "${detected_root_fs:-ext4}"
+        root_fs=$FS_RESULT
+        say ""
+        warn "Formatting $rdiskr as $root_fs permanently erases that partition."
+        typed=$(ask "Type the full partition path to confirm" "CANCEL")
+        [ "$typed" = "$rdiskr" ] || die "root formatting was not confirmed"
         format_filesystem "$root_fs" "$rdiskr" CRUX_ROOT
     else
         root_fs=$detected_root_fs
@@ -768,19 +976,29 @@ manual_partition() {
     mount_root_target
 
     if is_uefi; then
-        default_boot=$(partdev 1)
-        boot=$(ask "EFI System Partition" "$default_boot")
-        validate_block_or_die "EFI System Partition" "$boot"
+        suggested_esp=$(find_esp_candidate || true)
+        say ""
+        [ -n "$suggested_esp" ] && say "Detected likely EFI System Partition: $suggested_esp"
+        while :; do
+            select_existing_partition "EFI System" no || continue
+            boot=$SELECTED_BLOCK
+            [ "$boot" != "$rdiskr" ] || { warn "root and EFI partitions cannot be the same"; continue; }
+            break
+        done
         boot_fs=$(blk_value TYPE "$boot")
         if [ "$boot_fs" != "vfat" ]; then
             warn "$boot currently reports filesystem '${boot_fs:-unknown}'"
             if confirm "Format $boot as FAT32?" "n"; then
+                typed=$(ask "Type the full EFI partition path to confirm" "CANCEL")
+                [ "$typed" = "$boot" ] || die "EFI formatting was not confirmed"
                 have mkfs.vfat || die "mkfs.vfat is required"
                 mkfs.vfat -F 32 -n EFI "$boot" || die "failed to format $boot"
             else
                 die "UEFI installation requires a FAT32 EFI System Partition"
             fi
-        elif confirm "Reformat the existing EFI partition? This removes existing boot files." "n"; then
+        elif confirm "Reformat the existing EFI partition? This removes every boot file on it." "n"; then
+            typed=$(ask "Type the full EFI partition path to confirm" "CANCEL")
+            [ "$typed" = "$boot" ] || die "EFI formatting was not confirmed"
             mkfs.vfat -F 32 -n EFI "$boot" || die "failed to format $boot"
         fi
         mkdir -p "$TARGET/boot"
@@ -789,24 +1007,37 @@ manual_partition() {
         boot=""
     fi
 
-    sw=$(ask_optional "Swap partition" "")
-    if [ -n "$sw" ]; then
-        validate_block_or_die "swap partition" "$sw"
+    while :; do
+        select_existing_partition "Swap" yes || continue
+        sw=$SELECTED_BLOCK
+        [ -z "$sw" ] && break
+        [ "$sw" != "$rdiskr" ] && [ "$sw" != "$boot" ] || { warn "swap must be a different partition"; continue; }
+        if is_partition_mounted "$sw"; then warn "$sw is mounted"; continue; fi
         if [ "$(blk_value TYPE "$sw")" != "swap" ]; then
-            confirm "Format $sw as swap?" "y" || die "selected swap partition is not formatted as swap"
+            confirm "Format $sw as swap?" "y" || { sw=""; break; }
             mkswap -L swap "$sw" || die "failed to format swap partition"
         fi
         swapon "$sw" || warn "could not enable swap during installation"
-    fi
+        break
+    done
 
     home=""
     home_fs=""
     if confirm "Use a separate /home partition?" "n"; then
-        home=$(ask_optional "Home partition" "")
-        validate_block_or_die "home partition" "$home"
+        while :; do
+            select_existing_partition "Home" no || continue
+            home=$SELECTED_BLOCK
+            [ "$home" != "$rdiskr" ] && [ "$home" != "$boot" ] && [ "$home" != "$sw" ] || {
+                warn "/home must use a different partition"; continue;
+            }
+            break
+        done
         detected_home_fs=$(blk_value TYPE "$home")
         if confirm "Format $home?" "n"; then
-            home_fs=$(filesystem_menu "the home partition" "${detected_home_fs:-ext4}")
+            filesystem_menu "the home partition" "${detected_home_fs:-ext4}"
+            home_fs=$FS_RESULT
+            typed=$(ask "Type the full home partition path to confirm" "CANCEL")
+            [ "$typed" = "$home" ] || die "home formatting was not confirmed"
             format_filesystem "$home_fs" "$home" CRUX_HOME
         else
             home_fs=$detected_home_fs
@@ -868,20 +1099,14 @@ setup_base_packages() {
     say ""
     say "Base system installation"
     say "------------------------"
-    say "The official CRUX setup program is the safest way to select a complete"
-    say "base system and bootloader packages. Automated core-only mode is intended"
-    say "for experienced users and still requires later ports builds."
-    say ""
-    say "  1) Launch official /usr/bin/setup (recommended)"
-    say "  2) Install every package in the ISO core collection automatically"
+    say "  1) Automatic: install every package in the ISO core collection"
+    say "  2) Advanced: launch the official CRUX setup package selector"
     base_choice=$(choose_number "Base installation method" "1" 1 2)
     case "$base_choice" in
-        1) /usr/bin/setup || die "official CRUX setup failed" ;;
-        2) install_core_from_iso ;;
+        1) base_install_method=automatic; install_core_from_iso ;;
+        2) base_install_method=official; /usr/bin/setup || die "official CRUX setup failed" ;;
     esac
 
-    # Bootloaders moved to opt in CRUX 3.8. Install missing pieces from the ISO
-    # when available, even if the user did not select them in setup.
     if is_uefi; then
         [ -x "$TARGET/usr/sbin/grub-install" ] || install_iso_pkg opt grub2 || true
         install_iso_pkg opt grub2-efi || true
@@ -891,6 +1116,7 @@ setup_base_packages() {
     fi
     install_iso_pkg opt sudo || true
     install_iso_pkg opt prt-utils || true
+    install_iso_pkg opt linux-firmware || true
     verify_base_install
 }
 
@@ -1113,6 +1339,15 @@ enable_kde_repo() {
     ensure_prtdir_line /usr/ports/kde-plasma-6
 }
 
+enable_alan_repo_for_sddm() {
+    write_httpup_repo alan /usr/ports/alan https://www.mizrahi.com.ve/crux/ports/
+    write_public_key alan "alan public key" \
+        "RWSHHtGdlW9unGuKcA4PJdgmwJYRTcWgwvUPPkt3DRhVSb5U90KGOFyy"
+    # Keep this after all official and desktop-specific collections so duplicate
+    # ports cannot silently override them.
+    ensure_prtdir_line /usr/ports/alan
+}
+
 enable_xfce_repo() {
     write_httpup_repo xfce4 /usr/ports/xfce4 \
         https://codeberg.org/jlngn/xfce4/raw/branch/3.8
@@ -1216,45 +1451,158 @@ configure_privilege_escalation() {
     fi
 }
 
+detect_gpu_vendor() {
+    vendors=""
+    gpu_lines=""
+    if have lspci; then
+        gpu_lines=$(lspci -nn 2>/dev/null | grep -Ei 'VGA compatible controller|3D controller|Display controller' || true)
+        printf '%s\n' "$gpu_lines" | grep -qi 'NVIDIA' && vendors="$vendors nvidia"
+        printf '%s\n' "$gpu_lines" | grep -Eqi 'AMD|ATI' && vendors="$vendors amd"
+        printf '%s\n' "$gpu_lines" | grep -qi 'Intel' && vendors="$vendors intel"
+        printf '%s\n' "$gpu_lines" | grep -Eqi 'VMware' && vendors="$vendors vmware"
+        printf '%s\n' "$gpu_lines" | grep -Eqi 'VirtualBox|InnoTek' && vendors="$vendors virtualbox"
+    else
+        for vendor_file in /sys/bus/pci/devices/*/vendor; do
+            [ -r "$vendor_file" ] || continue
+            class_file=${vendor_file%/vendor}/class
+            class=$(cat "$class_file" 2>/dev/null || true)
+            case "$class" in 0x03*) ;; *) continue ;; esac
+            vendor=$(cat "$vendor_file" 2>/dev/null || true)
+            case "$vendor" in
+                0x10de) vendors="$vendors nvidia" ;;
+                0x1002) vendors="$vendors amd" ;;
+                0x8086) vendors="$vendors intel" ;;
+                0x15ad) vendors="$vendors vmware" ;;
+                0x80ee) vendors="$vendors virtualbox" ;;
+            esac
+        done
+    fi
+    vendors=$(printf '%s\n' "$vendors" | tr ' ' '\n' | sed '/^$/d' | awk '!seen[$0]++' | paste -sd+ -)
+    [ -n "$vendors" ] || vendors=generic
+    detected_gpu=$vendors
+}
+
+choose_nvidia_module_flavor() {
+    # CRUX's nvidia port supports both NVIDIA's open kernel modules and the
+    # traditional proprietary kernel modules. Open modules support Turing and
+    # newer hardware; the proprietary flavor remains necessary for older GPUs.
+    default_choice=2
+    case "$gpu_lines" in
+        *RTX*|*"GTX 16"*|*Turing*|*TU10*|*TU11*|*Ampere*|*Ada*|*Hopper*) default_choice=1 ;;
+    esac
+    say ""
+    say "NVIDIA kernel-module flavor"
+    say "---------------------------"
+    [ -n "$gpu_lines" ] && printf '%s\n' "$gpu_lines" | sed 's/^/  Detected: /'
+    say "  1) Open NVIDIA kernel modules (RTX 20 / GTX 16 / Turing or newer)"
+    say "  2) Proprietary kernel modules (GTX 10 / Pascal or older; broad fallback)"
+    module_choice=$(choose_number "NVIDIA module flavor" "$default_choice" 1 2)
+    case "$module_choice" in
+        1) nvidia_proprietary_modules=0 ;;
+        2) nvidia_proprietary_modules=1 ;;
+    esac
+}
+
+choose_gpu_driver() {
+    detect_gpu_vendor
+    say ""
+    say "Graphics driver"
+    say "---------------"
+    say "Detected graphics: $detected_gpu"
+    say "  1) Automatic detection (recommended)"
+    say "  2) NVIDIA proprietary/open-kernel-module package"
+    say "  3) AMD Mesa + amdgpu"
+    say "  4) Intel Mesa"
+    say "  5) Generic/virtual-machine Xorg drivers"
+    gpu_number=$(choose_number "Graphics profile" "1" 1 5)
+    case "$gpu_number" in
+        1)
+            case "$detected_gpu" in
+                *nvidia*) selected_gpu=nvidia ;;
+                *amd*) selected_gpu=amd ;;
+                *intel*) selected_gpu=intel ;;
+                *vmware*) selected_gpu=vmware ;;
+                *virtualbox*) selected_gpu=virtualbox ;;
+                *) selected_gpu=generic ;;
+            esac
+            ;;
+        2) selected_gpu=nvidia ;;
+        3) selected_gpu=amd ;;
+        4) selected_gpu=intel ;;
+        5) selected_gpu=generic ;;
+    esac
+    [ "$selected_gpu" = nvidia ] && choose_nvidia_module_flavor
+    info "graphics profile: $selected_gpu (detected: $detected_gpu)"
+}
+
 collect_optional_choices() {
     say ""
-    say "Optional system features"
-    say "------------------------"
-    say "  1) No graphical desktop"
-    say "  2) KDE Plasma 6 (community collection listed in CRUX PortDB)"
-    say "  3) Xfce (community collection listed in CRUX PortDB)"
-    desktop_number=$(choose_number "Desktop environment" "1" 1 3)
+    say "Installation profile"
+    say "--------------------"
+    say "  1) Full KDE Plasma 6 desktop (recommended)"
+    say "  2) Minimal console system"
+    desktop_number=$(choose_number "System profile" "1" 1 2)
     case "$desktop_number" in
         1)
-            desktop_choice=none
-            desktop_label=""
-            ;;
-        2)
             desktop_choice=kde
             desktop_label="KDE Plasma 6"
-            desktop_session_cmd='exec dbus-run-session -- startplasma-x11'
+            desktop_session_cmd='exec ck-launch-session dbus-run-session -- startplasma-x11'
+            use_networkmanager=yes
+            install_pipewire=yes
+            install_flatpak=yes
+            install_discover=yes
+            choose_gpu_driver
+            say ""
+            say "Graphical login"
+            say "  1) XDM from the official xorg collection (recommended, reliable)"
+            say "  2) SDDM from the signed community 'alan' collection"
+            say "  3) No display manager; log in and run startx"
+            dm_number=$(choose_number "Display manager" "1" 1 3)
+            case "$dm_number" in
+                1) display_manager=xdm; use_xdm=yes ;;
+                2)
+                    warn "SDDM is not in CRUX core/opt/xorg/compat-32; it comes from a community collection."
+                    confirm "Enable the signed alan collection for SDDM?" "n" || {
+                        warn "using official XDM instead"; display_manager=xdm; use_xdm=yes; dm_number=1;
+                    }
+                    if [ "$dm_number" = 2 ]; then
+                        display_manager=sddm
+                        enable_alan_sddm=yes
+                        use_xdm=no
+                    fi
+                    ;;
+                3) display_manager=none; use_xdm=no ;;
+            esac
+            install_firmware=yes
+            confirm "Enable Bluetooth support?" "y" && install_bluetooth=yes || install_bluetooth=no
+            confirm "Enable printing support (CUPS)?" "n" && install_printing=yes || install_printing=no
+            confirm "Enable 32-bit libraries for Steam/Wine/games?" "y" && {
+                enable_compat32=yes
+                install_gaming32=yes
+            } || {
+                enable_compat32=no
+                install_gaming32=no
+            }
             ;;
-        3)
-            desktop_choice=xfce
-            desktop_label="Xfce"
-            desktop_session_cmd='exec dbus-run-session -- startxfce4'
+        2)
+            desktop_choice=none
+            desktop_label=""
+            display_manager=none
+            use_xdm=no
+            use_networkmanager=no
+            install_pipewire=no
+            install_flatpak=no
+            enable_compat32=no
+            selected_gpu=generic
+            confirm "Install Flatpak on the console system?" "n" && install_flatpak=yes || true
             ;;
     esac
 
-    if [ "$desktop_choice" != none ]; then
-        confirm "Install XDM for a simple graphical login?" "y" && use_xdm=yes || use_xdm=no
-        confirm "Install NetworkManager for easy wired/Wi-Fi management?" "y" && use_networkmanager=yes || use_networkmanager=no
-        confirm "Install PipeWire audio and start it with the desktop session?" "y" && install_pipewire=yes || install_pipewire=no
-        confirm "Install Flatpak and add Flathub?" "y" && install_flatpak=yes || install_flatpak=no
-    else
-        use_xdm=no
-        use_networkmanager=no
-        install_pipewire=no
-        confirm "Install Flatpak on this console-only system?" "n" && install_flatpak=yes || install_flatpak=no
-    fi
-
-    confirm "Enable the official compat-32 collection for 32-bit applications?" "n" && enable_compat32=yes || enable_compat32=no
-    confirm "Synchronize ports and update installed packages to current CRUX 3.8 versions?" "y" && update_ports_now=yes || update_ports_now=no
+    confirm "Synchronize ports and update installed packages before building the desktop?" "y" && update_ports_now=yes || update_ports_now=no
+    say ""
+    say "CRUX has no official rolling 'unstable' collection."
+    say "Community collections may be newer, but they are not an unstable branch."
+    confirm "Show the advanced custom-repository prompt?" "n" && advanced_repositories=yes || advanced_repositories=no
 }
 
 configure_repositories() {
@@ -1267,63 +1615,134 @@ configure_repositories() {
         xfce) enable_xfce_repo ;;
     esac
 
-    if [ "$use_networkmanager" = yes ] || [ "$install_flatpak" = yes ] || [ "$install_pipewire" = yes ]; then
+    if [ "$desktop_choice" != none ] || [ "$use_networkmanager" = yes ] || [ "$install_flatpak" = yes ] || [ "$install_pipewire" = yes ]; then
         enable_contrib_repo
     fi
     [ "$enable_compat32" = yes ] && enable_compat32_repo
-
-    say ""
-    say "CRUX does not publish an official rolling 'unstable' collection."
-    say "Its normal collections track current stable releases. Individual user"
-    say "collections can be newer, but they are unsupported and may contain duplicates."
-    add_custom_httpup_repo
+    [ "$enable_alan_sddm" = yes ] && enable_alan_repo_for_sddm
+    [ "$advanced_repositories" = yes ] && add_custom_httpup_repo
     sync_ports_trees
+}
+
+verify_selected_port_plan() {
+    [ "$desktop_choice" != none ] || return 0
+    required="xorg dbus consolekit polkit networkmanager pipewire wireplumber alsa-utils alsa-ucm-conf plasma-meta kwin-x11 konsole dolphin polkit-kde-agent-1 plasma-nm plasma-pa"
+    [ "$install_flatpak" = yes ] && required="$required flatpak xdg-desktop-portal xdg-desktop-portal-kde discover"
+    case "$selected_gpu" in
+        nvidia)
+            required="$required nvidia"
+            [ "$install_gaming32" = yes ] && required="$required nvidia-32"
+            ;;
+        amd)
+            required="$required vulkan-loader glslang mesa xorg-xf86-video-amdgpu xorg-xf86-video-ati"
+            [ "$install_gaming32" = yes ] && required="$required vulkan-loader-32 mesa-32"
+            ;;
+        intel)
+            required="$required vulkan-loader glslang libclc python3-ply lua mesa"
+            [ "$install_gaming32" = yes ] && required="$required vulkan-loader-32 mesa-32"
+            ;;
+    esac
+    case "$display_manager" in xdm) required="$required xorg-xdm" ;; sddm) required="$required sddm" ;; esac
+    missing=""
+    for pkg in $required; do
+        port_exists "$pkg" || missing="$missing $pkg"
+    done
+    [ -z "$missing" ] || die "selected profile cannot be built because these ports are missing:$missing"
+    info "all required ports for the selected profile exist"
+}
+
+prepare_graphics_stack() {
+    # Mesa decides which Vulkan drivers to build by checking which development
+    # tools are already installed. Install those tools before any KDE/Qt
+    # dependency can pull Mesa into the system.
+    [ "$desktop_choice" != none ] || return 0
+    case "$selected_gpu" in
+        amd)
+            install_required_ports "AMD Vulkan build prerequisites" vulkan-loader glslang
+            install_required_ports "AMD Mesa graphics" mesa xorg-xf86-video-amdgpu xorg-xf86-video-ati
+            ;;
+        intel)
+            install_required_ports "Intel Vulkan build prerequisites" \
+                vulkan-loader glslang libclc python3-ply lua
+            install_required_ports "Intel Mesa graphics" mesa
+            install_optional_ports "legacy Intel Xorg driver" xorg-xf86-video-intel
+            ;;
+        vmware)
+            install_optional_ports "VMware graphics" xorg-xf86-video-vmware open-vm-tools
+            ;;
+        virtualbox)
+            install_optional_ports "VirtualBox graphics" xorg-xf86-video-vboxvideo
+            ;;
+        generic)
+            install_optional_ports "generic Xorg graphics" xorg-xf86-video-vesa
+            ;;
+    esac
+}
+
+prepare_flatpak_stack() {
+    [ "$install_flatpak" = yes ] || return 0
+    # Install Flatpak before Discover so Discover's build sees its backend.
+    install_required_ports "Flatpak base" flatpak xdg-desktop-portal xdg-utils xdg-user-dirs
 }
 
 configure_desktop() {
     [ "$desktop_choice" != none ] || return 0
 
-    install_required_ports "the Xorg base" \
-        xorg-server xorg-xinit xorg-xauth xorg-xf86-input-libinput mesa dbus
-
-    case "$desktop_choice" in
-        kde)
-            install_required_ports "KDE Plasma 6" plasma-meta kwin-x11
-            install_optional_ports "KDE applications" \
-                dolphin konsole ark kate gwenview okular partitionmanager \
-                plasma-pa ocean-sound-theme
-            ;;
-        xfce)
-            install_required_ports "Xfce" xfce4
-            install_optional_ports "Xfce applications" \
-                xfce4-terminal thunar thunar-volman thunar-archive-plugin tumbler \
-                mousepad ristretto parole xarchiver xfce4-screenshooter \
-                xfce4-notifyd xfce4-pulseaudio-plugin
-            ;;
-    esac
-
-    if [ "$use_xdm" = yes ]; then
-        install_required_ports "XDM" xorg-xdm
-    fi
+    install_required_ports "the Xorg desktop base" xorg dbus consolekit polkit
 
     if [ "$use_networkmanager" = yes ]; then
         install_required_ports "NetworkManager" networkmanager
-        case "$desktop_choice" in
-            kde) install_optional_ports "KDE NetworkManager integration" plasma-nm ;;
-            xfce) install_optional_ports "NetworkManager tray applet" network-manager-applet ;;
-        esac
+        install_optional_ports "wireless support" wpa_supplicant iwd
     fi
 
     if [ "$install_pipewire" = yes ]; then
-        install_required_ports "PipeWire audio" pipewire alsa-utils alsa-ucm-conf
-        install_optional_ports "PipeWire controls" pavucontrol
+        install_required_ports "PipeWire audio" pipewire wireplumber alsa-utils alsa-ucm-conf
+        install_optional_ports "audio controls" pavucontrol
+    fi
+
+    case "$desktop_choice" in
+        kde)
+            # The KDE repository itself recommends plasma-meta as the starting point.
+            install_required_ports "KDE Plasma 6" \
+                plasma-meta kwin-x11 konsole dolphin polkit-kde-agent-1 plasma-nm plasma-pa
+            [ "$install_flatpak" = yes ] && install_required_ports "KDE Discover" discover
+            install_optional_ports "KDE desktop applications" \
+                ark kate gwenview okular partitionmanager spectacle filelight kcalc \
+                plasma-systemmonitor plasma-welcome kscreen kinfocenter
+            install_optional_ports "KDE desktop integration" \
+                powerdevil upower udisks2 breeze-gtk kde-gtk-config
+            install_optional_ports "desktop fonts and firmware" \
+                xorg-font-dejavu-ttf otf-noto linux-firmware
+            ;;
+        xfce)
+            install_required_ports "Xfce" xfce4
+            ;;
+    esac
+
+    case "$display_manager" in
+        xdm)
+            install_required_ports "XDM" xorg-xdm
+            service_exists xdm || die "xorg-xdm installed but /etc/rc.d/xdm is missing"
+            ;;
+        sddm)
+            install_required_ports "SDDM" sddm
+            service_exists sddm || die "the community sddm port did not provide /etc/rc.d/sddm; choose official XDM"
+            ;;
+    esac
+
+    if [ "$install_bluetooth" = yes ]; then
+        install_optional_ports "Bluetooth" bluez
+    fi
+    if [ "$install_printing" = yes ]; then
+        install_optional_ports "printing" cups cups-filters
     fi
 
     setup_desktop_session_files
+    configure_display_manager
 }
 
 setup_desktop_session_files() {
-    [ -n "$desktop_session_cmd" ] || return 0
+    [ "$desktop_choice" != none ] || return 0
     user_home="$TARGET/home/$user_name"
     [ -d "$user_home" ] || return 0
 
@@ -1334,36 +1753,100 @@ setup_desktop_session_files() {
     esac
 
     session_file="$user_home/.xsession"
-    {
-        printf '#!/bin/sh\n'
-        if [ "$install_pipewire" = yes ]; then
-            # Keep PipeWire and the desktop inside the same D-Bus user session.
-            printf '%s\n' "exec dbus-run-session -- sh -c '"
-            printf '%s\n' '    pipewire >/tmp/pipewire.log 2>&1 &'
-            printf '%s\n' '    pipewire-pulse >/tmp/pipewire-pulse.log 2>&1 &'
-            printf '    exec %s\n' "$session_program"
-            printf '%s\n' "'"
-        else
-            printf '%s\n' "$desktop_session_cmd"
-        fi
-    } > "$session_file"
+    cat > "$session_file" <<EOF
+#!/bin/sh
+export XDG_SESSION_TYPE=x11
+export XDG_CURRENT_DESKTOP=KDE
+export XDG_SESSION_DESKTOP=KDE
+
+# ConsoleKit supplies session/seat tracking on stock CRUX. Keep ConsoleKit
+# outside the per-user D-Bus session so both see the whole desktop process.
+exec ck-launch-session dbus-run-session -- $session_program
+EOF
     cp "$session_file" "$user_home/.xinitrc"
-    chroot "$TARGET" /bin/chown "$user_name:$user_name" "/home/$user_name/.xsession" "/home/$user_name/.xinitrc" || true
     chmod 0755 "$session_file" "$user_home/.xinitrc"
+
+    if [ "$install_pipewire" = yes ]; then
+        mkdir -p "$user_home/.local/bin" "$user_home/.config/autostart"
+        audio_start="$user_home/.local/bin/crux-start-pipewire"
+        cat > "$audio_start" <<'EOF'
+#!/bin/sh
+if ! pgrep -x pipewire >/dev/null 2>&1; then
+    pipewire >/tmp/pipewire.log 2>&1 &
+fi
+if ! pgrep -x pipewire-pulse >/dev/null 2>&1; then
+    pipewire-pulse >/tmp/pipewire-pulse.log 2>&1 &
+fi
+if ! pgrep -x wireplumber >/dev/null 2>&1; then
+    wireplumber >/tmp/wireplumber.log 2>&1 &
+fi
+exit 0
+EOF
+        chmod 0755 "$audio_start"
+        cat > "$user_home/.config/autostart/crux-pipewire.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=PipeWire audio session
+Exec=/home/$user_name/.local/bin/crux-start-pipewire
+X-KDE-autostart-after=panel
+NoDisplay=true
+EOF
+    fi
+
+    chroot "$TARGET" /bin/chown "$user_name:$user_name" "/home/$user_name/.xsession" "/home/$user_name/.xinitrc" || true
+    [ -d "$user_home/.config" ] && chroot "$TARGET" /bin/chown -R "$user_name:$user_name" "/home/$user_name/.config" || true
+    [ -d "$user_home/.local" ] && chroot "$TARGET" /bin/chown -R "$user_name:$user_name" "/home/$user_name/.local" || true
+}
+
+configure_display_manager() {
+    case "$display_manager" in
+        xdm)
+            xdm_dir="$TARGET/etc/X11/xdm"
+            [ -d "$xdm_dir" ] || return 0
+            # XDM runs ~/.xsession through Xsession on CRUX. Make the login box
+            # less prehistoric without depending on an unsupported theme stack.
+            if [ -f "$xdm_dir/Xresources" ]; then
+                cat >> "$xdm_dir/Xresources" <<'EOF'
+
+! CRUX Easy Installer defaults
+xlogin*login.translations: #override Ctrl<Key>R: abort-display()\n<Key>F1: set-session-argument(failsafe) finish-field()\n<Key>Return: set-session-argument() finish-field()
+xlogin*greeting: CRUX KDE Plasma
+xlogin*namePrompt: Login:\040
+xlogin*passwdPrompt: Password:\040
+EOF
+            fi
+            ;;
+        sddm)
+            mkdir -p "$TARGET/etc/sddm.conf.d"
+            cat > "$TARGET/etc/sddm.conf.d/10-crux-kde.conf" <<EOF
+[General]
+DisplayServer=x11
+
+[Theme]
+Current=breeze
+
+[Users]
+RememberLastUser=true
+RememberLastSession=true
+
+EOF
+            ;;
+    esac
 }
 
 configure_flatpak() {
     [ "$install_flatpak" = yes ] || return 0
-    install_required_ports "Flatpak" flatpak xdg-desktop-portal xdg-utils xdg-user-dirs
+    # Base packages were installed before KDE/Discover; verify rather than rebuild.
+    install_required_ports "Flatpak base" flatpak xdg-desktop-portal xdg-utils xdg-user-dirs
     case "$desktop_choice" in
-        kde) install_optional_ports "KDE Flatpak portal" xdg-desktop-portal-kde ;;
+        kde) install_required_ports "KDE Flatpak portal" xdg-desktop-portal-kde ;;
         *) install_optional_ports "GTK Flatpak portal" xdg-desktop-portal-gtk ;;
     esac
     if chroot "$TARGET" /usr/bin/flatpak remote-add --if-not-exists flathub \
         https://dl.flathub.org/repo/flathub.flatpakrepo; then
         info "added the Flathub system remote"
     else
-        warn "Flatpak installed, but adding Flathub failed; retry after the first boot"
+        warn "Flatpak installed, but adding Flathub failed; retry after first boot"
     fi
 }
 
@@ -1382,6 +1865,51 @@ update_installed_ports() {
     fi
 }
 
+install_gpu_drivers() {
+    [ "$desktop_choice" != none ] || return 0
+    case "$selected_gpu" in
+        nvidia)
+            [ -n "$kernel_version" ] || die "kernel version is unknown; cannot build NVIDIA modules"
+            mkdir -p "$TARGET/lib/modules/$kernel_version"
+            ln -snf "/usr/src/linux-$kernel_version" "$TARGET/lib/modules/$kernel_version/build"
+            info "building the NVIDIA driver for target kernel $kernel_version"
+            chroot_run "export KVER='$kernel_version'; export NVIDIA_PROPRIETARY_MODULES='$nvidia_proprietary_modules'; prt-get depinst nvidia" || \
+                die "NVIDIA driver build failed for kernel $kernel_version"
+            if [ "$install_gaming32" = yes ]; then
+                install_required_ports "32-bit NVIDIA libraries" nvidia-32
+            fi
+            chroot "$TARGET" /sbin/depmod -a "$kernel_version" || warn "depmod failed for $kernel_version"
+            mkdir -p "$TARGET/etc/modprobe.d"
+            cat > "$TARGET/etc/modprobe.d/nvidia.conf" <<'EOF'
+options nvidia_drm modeset=1 fbdev=1
+blacklist nouveau
+EOF
+            ;;
+        amd|intel)
+            # The 64-bit Mesa stack was deliberately built before KDE so its
+            # optional Vulkan drivers were enabled. Add multilib after that.
+            if [ "$install_gaming32" = yes ]; then
+                install_required_ports "32-bit Mesa/Vulkan graphics" vulkan-loader-32 mesa-32
+            fi
+            ;;
+        vmware|virtualbox|generic)
+            # User-space Xorg drivers were installed before KDE.
+            ;;
+    esac
+}
+
+configure_gpu_boot() {
+    grub_file="$TARGET/etc/default/grub"
+    [ -f "$grub_file" ] || return 0
+    case "$selected_gpu" in
+        nvidia)
+            current=$(sed -n 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/\1/p' "$grub_file" | head -n1)
+            case " $current " in *' nvidia_drm.modeset=1 '*) ;; *) current="$current nvidia_drm.modeset=1" ;; esac
+            sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"$(printf '%s' "$current" | sed 's/^ *//')\"|" "$grub_file"
+            ;;
+    esac
+}
+
 write_locale_configuration() {
     if [ "$locale_name" = "C.UTF-8" ] || [ "$locale_name" = "C" ] || [ "$locale_name" = "POSIX" ]; then
         return 0
@@ -1393,8 +1921,12 @@ write_locale_configuration() {
         else
             printf '%s UTF-8\n' "$locale_name" >> "$TARGET/etc/locale.gen"
         fi
-        if [ -x "$TARGET/usr/bin/locale-gen" ]; then
+        if [ -x "$TARGET/usr/sbin/locale-gen" ]; then
+            chroot "$TARGET" /usr/sbin/locale-gen || warn "locale-gen failed"
+        elif [ -x "$TARGET/usr/bin/locale-gen" ]; then
             chroot "$TARGET" /usr/bin/locale-gen || warn "locale-gen failed"
+        else
+            warn "locale-gen is unavailable; keeping the locale configuration for first boot"
         fi
     fi
     mkdir -p "$TARGET/etc/profile.d"
@@ -1448,25 +1980,22 @@ write_fstab() {
 configure_classic_network() {
     [ -n "$nic_conf" ] || return 0
     net_script="$TARGET/etc/rc.d/net"
-    [ -f "$net_script" ] || {
-        warn "target has no /etc/rc.d/net script; network was not written"
-        return 0
-    }
+    [ -f "$net_script" ] || { warn "target has no /etc/rc.d/net script"; return 0; }
     case "$ip_mode" in
         dhcp)
             sed -i \
                 -e 's/^TYPE=.*/TYPE="DHCP"/' \
-                -e "s|^DEV=.*|DEV=\"$nic_conf\"|" \
-                -e "s|^DHCPOPTS=.*|DHCPOPTS=\"$nic_conf -h \\\`/bin/hostname\\\` -t 10\"|" \
+                -e "s|^DEV=.*|DEV=$nic_conf|" \
+                -e 's|^DHCPOPTS=.*|DHCPOPTS="-h `/bin/hostname` -t 10"|' \
                 "$net_script" || warn "failed to update DHCP settings"
             ;;
         static)
             sed -i \
                 -e 's/^TYPE=.*/TYPE="static"/' \
-                -e "s|^DEV=.*|DEV=\"$nic_conf\"|" \
-                -e "s|^ADDR=.*|ADDR=\"$ip_addr\"|" \
-                -e "s|^MASK=.*|MASK=\"$subnet_mask\"|" \
-                -e "s|^GW=.*|GW=\"$gateway\"|" \
+                -e "s|^DEV=.*|DEV=$nic_conf|" \
+                -e "s|^ADDR=.*|ADDR=$ip_addr|" \
+                -e "s|^MASK=.*|MASK=$subnet_mask|" \
+                -e "s|^GW=.*|GW=$gateway|" \
                 "$net_script" || warn "failed to update static network settings"
             ;;
     esac
@@ -1475,24 +2004,28 @@ configure_classic_network() {
 build_services_list() {
     services_list=""
     add_service lo
-    if service_exists dbus && [ "$desktop_choice" != none ]; then
-        add_service dbus
-    fi
+    [ "$desktop_choice" != none ] && service_exists dbus && add_service dbus
     if [ "$use_networkmanager" = yes ] && service_exists networkmanager; then
         add_service networkmanager
     elif [ -n "$nic_conf" ] && service_exists net; then
         add_service net
     fi
+    [ "$install_bluetooth" = yes ] && service_exists bluetooth && add_service bluetooth
+    [ "$install_bluetooth" = yes ] && service_exists bluez && add_service bluez
+    [ "$install_printing" = yes ] && service_exists cups && add_service cups
+    [ "$selected_gpu" = nvidia ] && service_exists nvidia-powerd && add_service nvidia-powerd
     service_exists crond && add_service crond
-    if service_exists sshd && confirm "Enable the SSH server at boot?" "n"; then
-        add_service sshd
+    if service_exists sshd; then
+        if [ "$enable_sshd" = ask ]; then
+            confirm "Enable the SSH server at boot?" "n" && enable_sshd=yes || enable_sshd=no
+        fi
+        [ "$enable_sshd" = yes ] && add_service sshd
     fi
-    if [ "$install_pipewire" = yes ] && service_exists alsa; then
-        add_service alsa
-    fi
-    if [ "$use_xdm" = yes ] && service_exists xdm; then
-        add_service xdm
-    fi
+    [ "$install_pipewire" = yes ] && service_exists alsa && add_service alsa
+    case "$display_manager" in
+        xdm) service_exists xdm && add_service xdm ;;
+        sddm) service_exists sddm && add_service sddm ;;
+    esac
 }
 
 write_system_configuration() {
@@ -1573,23 +2106,35 @@ unpack_kernel() {
 
 force_root_fs_builtin() {
     case "$root_fs" in
-        ext2|ext3|ext4) symbol=EXT4_FS ;;
-        btrfs) symbol=BTRFS_FS ;;
-        xfs) symbol=XFS_FS ;;
-        jfs) symbol=JFS_FS ;;
-        *) return 0 ;;
+        ext2|ext3|ext4) root_symbol=EXT4_FS ;;
+        btrfs) root_symbol=BTRFS_FS ;;
+        xfs) root_symbol=XFS_FS ;;
+        jfs) root_symbol=JFS_FS ;;
+        *) root_symbol="" ;;
     esac
     config="$kernel_dir/.config"
     [ -f "$config" ] || return 0
+    symbols="DEVTMPFS DEVTMPFS_MOUNT TMPFS EFI_PARTITION BLOCK BLK_DEV_SD SCSI SATA_AHCI NVME_CORE BLK_DEV_NVME"
+    [ -n "$root_symbol" ] && symbols="$symbols $root_symbol"
+    case "$selected_gpu" in
+        amd) symbols="$symbols DRM DRM_AMDGPU" ;;
+        intel) symbols="$symbols DRM DRM_I915" ;;
+        nvidia) symbols="$symbols DRM DRM_SIMPLEDRM" ;;
+    esac
     if [ -x "$kernel_dir/scripts/config" ]; then
-        chroot_run "cd /usr/src/linux-$kernel_version && scripts/config --enable $symbol" ||
-            warn "could not force CONFIG_$symbol=y"
+        for symbol in $symbols; do
+            chroot_run "cd /usr/src/linux-$kernel_version && scripts/config --enable $symbol" || \
+                warn "could not force CONFIG_$symbol=y"
+        done
+        [ "$selected_gpu" = nvidia ] && chroot_run "cd /usr/src/linux-$kernel_version && scripts/config --disable DRM_NOUVEAU" || true
     else
-        sed -i \
-            -e "s/^CONFIG_${symbol}=m$/CONFIG_${symbol}=y/" \
-            -e "s/^# CONFIG_${symbol} is not set$/CONFIG_${symbol}=y/" \
-            "$config"
-        grep -q "^CONFIG_${symbol}=y$" "$config" || printf 'CONFIG_%s=y\n' "$symbol" >> "$config"
+        for symbol in $symbols; do
+            sed -i \
+                -e "s/^CONFIG_${symbol}=m$/CONFIG_${symbol}=y/" \
+                -e "s/^# CONFIG_${symbol} is not set$/CONFIG_${symbol}=y/" \
+                "$config"
+            grep -q "^CONFIG_${symbol}=y$" "$config" || printf 'CONFIG_%s=y\n' "$symbol" >> "$config"
+        done
     fi
 }
 
@@ -1601,7 +2146,7 @@ build_kernel() {
     force_root_fs_builtin
     chroot_run "cd /usr/src/linux-$kernel_version && make olddefconfig" || die "make olddefconfig failed"
 
-    if confirm "Open kernel menuconfig before compiling?" "y"; then
+    if confirm "Open kernel menuconfig for expert changes?" "n"; then
         chroot_run "cd /usr/src/linux-$kernel_version && make menuconfig" || die "kernel menuconfig failed"
     fi
 
@@ -1618,6 +2163,9 @@ build_kernel() {
     cp "$kernel_dir/System.map" "$TARGET/boot/System.map-$kernel_version" || die "failed to install System.map"
     cp "$kernel_dir/.config" "$TARGET/boot/config-$kernel_version" || die "failed to save kernel config"
     ln -snf "vmlinuz-$kernel_version" "$TARGET/boot/vmlinuz"
+    mkdir -p "$TARGET/lib/modules/$kernel_version"
+    ln -snf "/usr/src/linux-$kernel_version" "$TARGET/lib/modules/$kernel_version/build"
+    chroot "$TARGET" /sbin/depmod -a "$kernel_version" 2>/dev/null || true
     info "installed Linux $kernel_version"
 }
 
@@ -1663,8 +2211,57 @@ EOF
         info "installing GRUB for legacy BIOS on $rdisk"
         chroot_run "grub-install --target=i386-pc --recheck $rdisk" || die "GRUB BIOS installation failed"
     fi
+    configure_gpu_boot
     chroot_run 'grub-mkconfig -o /boot/grub/grub.cfg' || die "grub-mkconfig failed"
 }
+
+validate_installation() {
+    say ""
+    say "Final validation"
+    say "----------------"
+    failures=""
+    [ -s "$TARGET/etc/fstab" ] || failures="$failures /etc/fstab"
+    [ -s "$TARGET/etc/rc.conf" ] || failures="$failures /etc/rc.conf"
+    [ -s "$TARGET/boot/vmlinuz-$kernel_version" ] || failures="$failures kernel-image"
+    [ -s "$TARGET/boot/grub/grub.cfg" ] || failures="$failures grub.cfg"
+    [ -x "$TARGET/usr/bin/prt-get" ] || failures="$failures prt-get"
+    grep -q "^${user_name}:" "$TARGET/etc/passwd" 2>/dev/null || failures="$failures user-account"
+    if [ "$desktop_choice" = kde ]; then
+        [ -x "$TARGET/usr/bin/startplasma-x11" ] || failures="$failures startplasma-x11"
+        [ -x "$TARGET/usr/bin/konsole" ] || failures="$failures konsole"
+        [ -x "$TARGET/usr/bin/dolphin" ] || failures="$failures dolphin"
+        [ -x "$TARGET/usr/bin/ck-launch-session" ] || failures="$failures ck-launch-session"
+        [ -x "$TARGET/usr/bin/dbus-run-session" ] || failures="$failures dbus-run-session"
+    fi
+    case "$display_manager" in
+        xdm)
+            [ -x "$TARGET/etc/rc.d/xdm" ] || failures="$failures xdm-service"
+            case " $services_list " in *" xdm "*) ;; *) failures="$failures xdm-not-enabled" ;; esac
+            ;;
+        sddm)
+            [ -x "$TARGET/etc/rc.d/sddm" ] || failures="$failures sddm-service"
+            case " $services_list " in *" sddm "*) ;; *) failures="$failures sddm-not-enabled" ;; esac
+            ;;
+    esac
+    if [ "$install_flatpak" = yes ]; then
+        [ -x "$TARGET/usr/bin/flatpak" ] || failures="$failures flatpak"
+        chroot "$TARGET" /usr/bin/flatpak remotes --columns=name 2>/dev/null | grep -Fxq flathub || failures="$failures flathub-remote"
+    fi
+    if [ "$selected_gpu" = nvidia ]; then
+        find "$TARGET/lib/modules/$kernel_version" -type f -name 'nvidia*.ko*' 2>/dev/null | grep -q . || failures="$failures nvidia-kernel-modules"
+        [ -x "$TARGET/usr/bin/nvidia-smi" ] || failures="$failures nvidia-smi"
+    fi
+    case "$selected_gpu" in
+        amd|intel)
+            find "$TARGET/usr/lib" -type f \( -name 'libGL.so*' -o -name 'libEGL.so*' \) 2>/dev/null | grep -q . || failures="$failures mesa-runtime"
+            ;;
+    esac
+    if [ -n "$failures" ]; then
+        die "final validation failed; missing or invalid:$failures"
+    fi
+    chroot "$TARGET" /sbin/ldconfig 2>/dev/null || true
+    info "final validation passed"
+} 
 
 write_postinstall_notes() {
     notes="$TARGET/root/POSTINSTALL.txt"
@@ -1684,7 +2281,7 @@ EOF
     if [ -n "$desktop_label" ]; then
         cat >> "$notes" <<EOF
   Desktop:           $desktop_label
-  Graphical login:   $use_xdm
+  Display manager:   $display_manager
   NetworkManager:    $use_networkmanager
   PipeWire:          $install_pipewire
   Flatpak:           $install_flatpak
@@ -1711,8 +2308,7 @@ EOF
         cat >> "$notes" <<EOF
 
 PipeWire
-  PipeWire is started from /home/$user_name/.xsession and .xinitrc inside a
-  D-Bus user session. Use alsamixer and 'alsactl store' to configure ALSA.
+  PipeWire, pipewire-pulse, and WirePlumber are started by one KDE autostart launcher at ~/.local/bin/crux-start-pipewire. Use alsamixer and 'alsactl store' to configure ALSA.
 EOF
     fi
     chmod 0600 "$notes"
@@ -1731,6 +2327,8 @@ show_summary() {
     say "Timezone:          $tzone"
     say "User:              $user_name"
     [ -n "$desktop_label" ] && say "Desktop:           $desktop_label"
+    [ "$desktop_choice" != none ] && say "Graphics:          $selected_gpu"
+    [ "$desktop_choice" != none ] && say "Display manager:   $display_manager"
     say "Services:          $services_list"
     say "Post-install file: /root/POSTINSTALL.txt"
 }
@@ -1823,12 +2421,19 @@ fresh_install() {
     collect_optional_choices
     configure_repositories
     configure_privilege_escalation
+    update_installed_ports
+    verify_selected_port_plan
+    prepare_graphics_stack
+    prepare_flatpak_stack
     configure_desktop
     configure_flatpak
-    update_installed_ports
     write_system_configuration
     build_kernel
+    install_gpu_drivers
+    # GPU packages may add boot parameters, modules, and services.
+    write_system_configuration
     install_bootloader
+    validate_installation
     rejected_files_warning
     write_postinstall_notes
     show_summary
@@ -1901,16 +2506,41 @@ finish_menu() {
     esac
 }
 
+self_test() {
+    failures=0
+    valid_hostname crux || failures=$((failures + 1))
+    valid_hostname bad_name && failures=$((failures + 1))
+    valid_username robert || failures=$((failures + 1))
+    valid_username root && failures=$((failures + 1))
+    valid_ipv4 192.168.1.1 || failures=$((failures + 1))
+    valid_ipv4 999.1.1.1 && failures=$((failures + 1))
+    rdisk=/dev/nvme0n1
+    [ "$(partdev 3)" = /dev/nvme0n1p3 ] || failures=$((failures + 1))
+    rdisk=/dev/sda
+    [ "$(partdev 3)" = /dev/sda3 ] || failures=$((failures + 1))
+    FS_RESULT=ext4
+    case "$FS_RESULT" in ext4|btrfs|xfs|jfs|ext3|ext2) ;; *) failures=$((failures + 1)) ;; esac
+    if [ "$failures" -ne 0 ]; then
+        printf 'self-test: FAIL (%s checks failed)\n' "$failures" >&2
+        return 1
+    fi
+    printf 'self-test: PASS\n'
+}
+
 main() {
     trap on_interrupt INT TERM HUP
     case "${1:-}" in
         --version)
-            printf 'CRUX Enhanced Installer %s (CRUX %s)\n' "$VERSION" "$CRUX_RELEASE"
+            printf 'CRUX Easy Installer %s (CRUX %s)\n' "$VERSION" "$CRUX_RELEASE"
             exit 0
             ;;
         --help|-h)
             show_help
             exit 0
+            ;;
+        --self-test)
+            self_test
+            exit $?
             ;;
         --shell)
             exit 0
