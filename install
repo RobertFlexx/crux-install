@@ -6,7 +6,7 @@
 # found in the LICENSE file.
 
 
-VERSION="3.8-easy-3.0.1"
+VERSION="3.8-easy-3.1.0"
 CRUX_RELEASE="3.8"
 TARGET="/mnt"
 MEDIA="/media/crux"
@@ -1227,15 +1227,38 @@ set_config_value() {
 }
 
 configure_pkgmk_cache() {
-    mkdir -p "$TARGET/var/cache/pkgmk/distfiles" \
-             "$TARGET/var/cache/pkgmk/packages" \
-             "$TARGET/var/cache/pkgmk/work"
+    # Keep CRUX pkgmk's official per-port source/work layout.  Earlier releases
+    # of this installer forced every port into one shared distfiles directory.
+    # That can retain stale downloads and create basename collisions, producing
+    # repeated Signify MISMATCH failures across otherwise unrelated ports.
     pkgmk_conf="$TARGET/etc/pkgmk.conf"
     [ -f "$pkgmk_conf" ] || : > "$pkgmk_conf"
-    set_config_value "$pkgmk_conf" PKGMK_SOURCE_DIR '"/var/cache/pkgmk/distfiles"'
-    set_config_value "$pkgmk_conf" PKGMK_PACKAGE_DIR '"/var/cache/pkgmk/packages"'
-    # $name is intentionally literal; pkgmk expands it for each port.
-    set_config_value "$pkgmk_conf" PKGMK_WORK_DIR '"/var/cache/pkgmk/work/$name"'
+
+    legacy_cache=no
+    grep -q '^PKGMK_SOURCE_DIR="/var/cache/pkgmk/distfiles"$' "$pkgmk_conf" 2>/dev/null && legacy_cache=yes
+    grep -q '^PKGMK_WORK_DIR="/var/cache/pkgmk/work/\$name"$' "$pkgmk_conf" 2>/dev/null && legacy_cache=yes
+
+    # Remove only settings written by old versions of this installer.  Preserve
+    # any administrator-supplied pkgmk configuration.
+    sed -i \
+        -e '/^PKGMK_SOURCE_DIR="\/var\/cache\/pkgmk\/distfiles"$/d' \
+        -e '/^PKGMK_PACKAGE_DIR="\/var\/cache\/pkgmk\/packages"$/d' \
+        -e '/^PKGMK_WORK_DIR="\/var\/cache\/pkgmk\/work\/\$name"$/d' \
+        "$pkgmk_conf"
+
+    if [ "$legacy_cache" = yes ] && [ -d "$TARGET/var/cache/pkgmk/distfiles" ]; then
+        quarantine="$TARGET/var/cache/pkgmk/distfiles.installer-old"
+        suffix=0
+        while [ -e "$quarantine" ]; do
+            suffix=$((suffix + 1))
+            quarantine="$TARGET/var/cache/pkgmk/distfiles.installer-old.$suffix"
+        done
+        mv "$TARGET/var/cache/pkgmk/distfiles" "$quarantine" ||
+            die "could not quarantine the legacy shared pkgmk source cache"
+        warn "moved the old shared source cache to ${quarantine#$TARGET}; it will not be reused"
+    fi
+
+    mkdir -p "$TARGET/var/cache/pkgmk/packages"
 }
 
 ensure_prtdir_line() {
@@ -1269,6 +1292,34 @@ write_public_key() {
     chmod 0644 "$TARGET/etc/ports/${name}.pub"
 }
 
+public_key_value() {
+    awk '!/^untrusted comment:/ && NF {print; exit}' "$1" 2>/dev/null
+}
+
+install_verified_public_key() {
+    name=$1
+    comment=$2
+    expected=$3
+    target_file="$TARGET/etc/ports/${name}.pub"
+    live_file="/etc/ports/${name}.pub"
+
+    mkdir -p "$TARGET/etc/ports"
+    if [ -f "$target_file" ] && [ "$(public_key_value "$target_file")" = "$expected" ]; then
+        return 0
+    fi
+    if [ -f "$live_file" ] && [ "$(public_key_value "$live_file")" = "$expected" ]; then
+        cp "$live_file" "$target_file" || die "could not copy the trusted $name public key from the CRUX media"
+        chmod 0644 "$target_file"
+        return 0
+    fi
+
+    # Last-resort pinned key.  These values are version-specific and are
+    # checked below before any ports are synchronized or built.
+    write_public_key "$name" "$comment" "$expected"
+    [ "$(public_key_value "$target_file")" = "$expected" ] ||
+        die "failed to install the verified $name repository public key"
+}
+
 write_rsync_repo() {
     name=$1
     host=$2
@@ -1297,64 +1348,69 @@ URL=$url
 EOF
 }
 
+ensure_rsync_collection() {
+    name=$1
+    collection=$2
+    destination=$3
+    comment=$4
+    expected_key=$5
+    target_sync="$TARGET/etc/ports/${name}.rsync"
+    live_sync="/etc/ports/${name}.rsync"
+
+    mkdir -p "$TARGET/etc/ports"
+    if [ ! -f "$target_sync" ]; then
+        if [ -f "$live_sync" ]; then
+            cp "$live_sync" "$target_sync" || die "could not copy $name repository definition from the CRUX media"
+        else
+            write_rsync_repo "$name" crux.nu "$collection" "$destination"
+        fi
+    fi
+    install_verified_public_key "$name" "$comment" "$expected_key"
+    ensure_prtdir_line "$destination"
+}
+
 ensure_official_repositories() {
-    # Recreate the active CRUX 3.8 definitions. This also prevents an upgrade
-    # from accidentally syncing an older release through rejected config files.
-    write_rsync_repo core crux.nu ports/crux-3.8/core/ /usr/ports/core
-    write_public_key core "core public key"         "RWRZAkQEVz8SoR2Tu7Nhnv8Fm91/Y+HLWq7iUtixzM2w8Vv0BSkAXB8C"
-    write_rsync_repo opt crux.nu ports/crux-3.8/opt/ /usr/ports/opt
-    write_public_key opt "opt public key"         "RWSBCSYknENWgnHabtCJT/hAohKr9ThZ/vEZ94BgT9vFCsSFZhFZgkNr"
-    write_rsync_repo xorg crux.nu ports/crux-3.8/xorg/ /usr/ports/xorg
-    write_public_key xorg "xorg public key"         "RWRQdQmOIOqwe2/ZZuTSoQgMPPWm1YA/9H0L/1El2OVhj3+I4DWhKSjT"
-    ensure_prtdir_line /usr/ports/core
-    ensure_prtdir_line /usr/ports/opt
-    ensure_prtdir_line /usr/ports/xorg
+    # Preserve repository files installed by CRUX whenever possible.  Never
+    # blindly replace trusted keys.  Missing files are copied from the booted
+    # CRUX media, with pinned CRUX 3.8 values only as a last resort.
+    ensure_rsync_collection core ports/crux-3.8/core/ /usr/ports/core \
+        "core public key" "RWRZAkQEVz8SoR2Tu7Nhnv8Fm91/Y+HLWq7iUtixzM2w8Vv0BSkAXB8C"
+    ensure_rsync_collection opt ports/crux-3.8/opt/ /usr/ports/opt \
+        "opt public key" "RWSBCSYknENWgnHabtCJT/hAohKr9ThZ/vEZ94BgT9vFCsSFZhFZgkNr"
+    ensure_rsync_collection xorg ports/crux-3.8/xorg/ /usr/ports/xorg \
+        "xorg public key" "RWRQdQmOIOqwe2/ZZuTSoQgMPPWm1YA/9H0L/1El2OVhj3+I4DWhKSjT"
 }
 
 enable_contrib_repo() {
-    if [ -f "$TARGET/etc/ports/contrib.rsync.inactive" ] && [ ! -f "$TARGET/etc/ports/contrib.rsync" ]; then
-        mv "$TARGET/etc/ports/contrib.rsync.inactive" "$TARGET/etc/ports/contrib.rsync" ||
-            die "failed to enable the contrib repository"
-    fi
-    [ -f "$TARGET/etc/ports/contrib.rsync" ] || {
-        write_rsync_repo contrib crux.nu ports/crux-3.8/contrib/ /usr/ports/contrib
-        write_public_key contrib "contrib public key" "RWRg1hKiTWvlRYugeIBZSkPrlcxcgubttUMVWEsWsLNwX9naXZOrQYDn"
-    }
-    ensure_prtdir_line /usr/ports/contrib
+    [ -f "$TARGET/etc/ports/contrib.rsync.inactive" ] && [ ! -f "$TARGET/etc/ports/contrib.rsync" ] &&
+        mv "$TARGET/etc/ports/contrib.rsync.inactive" "$TARGET/etc/ports/contrib.rsync"
+    ensure_rsync_collection contrib ports/crux-3.8/contrib/ /usr/ports/contrib \
+        "contrib public key" "RWRg1hKiTWvlRYugeIBZSkPrlcxcgubttUMVWEsWsLNwX9naXZOrQYDn"
 }
 
 enable_compat32_repo() {
-    if [ -f "$TARGET/etc/ports/compat-32.rsync.inactive" ] && [ ! -f "$TARGET/etc/ports/compat-32.rsync" ]; then
-        mv "$TARGET/etc/ports/compat-32.rsync.inactive" "$TARGET/etc/ports/compat-32.rsync" ||
-            die "failed to enable compat-32"
-    fi
-    if [ ! -f "$TARGET/etc/ports/compat-32.rsync" ]; then
-        write_rsync_repo compat-32 crux.nu ports/crux-3.8/compat-32/ /usr/ports/compat-32
-    fi
-    write_public_key compat-32 "compat-32 public key"         "RWSKBMspqKIXKe5Sh37BEyxSuX/z/nzMQF8Mz1hNCNBJwCGu6ec8VRiB"
-    ensure_prtdir_line /usr/ports/compat-32
+    [ -f "$TARGET/etc/ports/compat-32.rsync.inactive" ] && [ ! -f "$TARGET/etc/ports/compat-32.rsync" ] &&
+        mv "$TARGET/etc/ports/compat-32.rsync.inactive" "$TARGET/etc/ports/compat-32.rsync"
+    ensure_rsync_collection compat-32 ports/crux-3.8/compat-32/ /usr/ports/compat-32 \
+        "compat-32 public key" "RWSKBMspqKIXKe5Sh37BEyxSuX/z/nzMQF8Mz1hNCNBJwCGu6ec8VRiB"
 }
 
 enable_kde_repo() {
-    write_rsync_repo kde-plasma-6 crux.nu ports/kde-plasma-6/3.8/ /usr/ports/kde-plasma-6
-    write_public_key kde-plasma-6 "kde-plasma-6 public key" \
-        "RWTGxEYrvi0p3tKFiaOBmZ1woLluPQA5irFYf2m7Tg5mW4A7QomqiApX"
-    ensure_prtdir_line /usr/ports/kde-plasma-6
+    ensure_rsync_collection kde-plasma-6 ports/kde-plasma-6/3.8/ /usr/ports/kde-plasma-6 \
+        "kde-plasma-6 public key" "RWTGxEYrvi0p3tKFiaOBmZ1woLluPQA5irFYf2m7Tg5mW4A7QomqiApX"
 }
 
 enable_alan_repo_for_sddm() {
     write_httpup_repo alan /usr/ports/alan https://www.mizrahi.com.ve/crux/ports/
-    write_public_key alan "alan public key" \
+    install_verified_public_key alan "alan public key" \
         "RWSHHtGdlW9unGuKcA4PJdgmwJYRTcWgwvUPPkt3DRhVSb5U90KGOFyy"
-    # Keep this after all official and desktop-specific collections so duplicate
-    # ports cannot silently override them.
     ensure_prtdir_line /usr/ports/alan
 }
 
 enable_xfce_repo() {
     write_httpup_repo xfce4 /usr/ports/xfce4 \
         https://codeberg.org/jlngn/xfce4/raw/branch/3.8
-    write_public_key xfce4 "xfce4 public key" \
+    install_verified_public_key xfce4 "xfce4 public key" \
         "RWRSAbUnL7azFG0NI3YD3U3PIgu839WrgGK9z4A5xwMTa5fcTz8iNW+B"
     ensure_prtdir_line /usr/ports/xfce4
 }
@@ -1421,7 +1477,7 @@ install_required_ports() {
     done
     [ -n "$package_list" ] || return 0
     info "installing $description: $package_list"
-    chroot_run "prt-get depinst $package_list" || die "failed to install $description"
+    chroot_run "prt-get depinst --log $package_list" || die "failed to install $description; use --resume after correcting the reported port or network error"
 }
 
 install_optional_ports() {
@@ -1606,7 +1662,10 @@ collect_optional_choices() {
             ;;
     esac
 
-    confirm "Synchronize ports and update installed packages before building the desktop?" "y" && update_ports_now=yes || update_ports_now=no
+    say ""
+    say "A full CRUX sysup recompiles the base system and may take hours."
+    say "It is not required to finish this installation and is safer after first boot."
+    confirm "Run the full source-based system update now?" "n" && update_ports_now=yes || update_ports_now=no
     say ""
     say "CRUX has no official rolling 'unstable' collection."
     say "Community collections may be newer, but they are not an unstable branch."
@@ -1862,13 +1921,18 @@ update_installed_ports() {
     [ "$update_ports_now" = yes ] || return 0
     say ""
     warn "A full ports update compiles packages from source and can take a long time."
-    info "updating installed packages with prt-get sysup"
-    chroot "$TARGET" /usr/bin/prt-get sysup ||
-        warn "prt-get sysup reported a failure; inspect the build output and $TARGET/var/log/pkgbuild"
+    info "checking the planned update with prt-get sysup --test"
+    chroot "$TARGET" /usr/bin/prt-get sysup --test ||
+        die "prt-get sysup test failed; no update was started"
+    info "updating installed packages with prt-get sysup --log"
+    if ! chroot "$TARGET" /usr/bin/prt-get sysup --log; then
+        die "the base-system update failed. Nothing after this point was attempted. Retry with --resume after fixing the reported port or network error"
+    fi
 
     if chroot "$TARGET" /usr/bin/prt-get info prt-utils >/dev/null 2>&1; then
         if [ ! -x "$TARGET/usr/bin/revdep" ] && [ ! -x "$TARGET/usr/sbin/revdep" ]; then
-            chroot "$TARGET" /usr/bin/prt-get depinst prt-utils || true
+            chroot "$TARGET" /usr/bin/prt-get depinst --log prt-utils ||
+                die "failed to install prt-utils after the system update"
         fi
     fi
 }
@@ -2519,7 +2583,7 @@ upgrade_install() {
     copy_resolver_configuration
     rejected_files_warning
 
-    if confirm "Synchronize CRUX 3.8 ports and run prt-get sysup?" "y"; then
+    if confirm "Synchronize CRUX 3.8 ports and run the full source-based sysup now?" "n"; then
         configure_pkgmk_cache
         configure_prt_get
         ensure_official_repositories
