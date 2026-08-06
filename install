@@ -6,7 +6,7 @@
 # found in the LICENSE file.
 
 
-VERSION="3.8-easy-3.0"
+VERSION="3.8-easy-3.0.1"
 CRUX_RELEASE="3.8"
 TARGET="/mnt"
 MEDIA="/media/crux"
@@ -358,6 +358,7 @@ show_help() {
 Usage: ${0##*/} [OPTION]
 
   --install       start a guided fresh installation
+  --resume        continue an interrupted installation already placed on disk
   --upgrade       mount an installed CRUX system and run the upgrade path
   --self-test     run non-destructive parser and mapping tests
   --shell         exit immediately to the installation shell
@@ -386,13 +387,15 @@ preflight() {
 main_menu() {
     say ""
     say "  1) Install CRUX 3.8"
-    say "  2) Upgrade an existing CRUX installation"
-    say "  3) Exit to shell"
-    choice=$(choose_number "Choose an action" "1" 1 3)
+    say "  2) Resume an interrupted installation"
+    say "  3) Upgrade an existing CRUX installation"
+    say "  4) Exit to shell"
+    choice=$(choose_number "Choose an action" "1" 1 4)
     case "$choice" in
         1) fresh_install ;;
-        2) upgrade_install ;;
-        3) exit 0 ;;
+        2) resume_install ;;
+        3) upgrade_install ;;
+        4) exit 0 ;;
     esac
 }
 
@@ -1385,11 +1388,16 @@ add_custom_httpup_repo() {
 }
 
 sync_ports_trees() {
-    info "synchronizing configured ports collections"
-    if [ -x "$TARGET/usr/bin/prt-get" ]; then
-        chroot "$TARGET" /usr/bin/prt-get sync || die "prt-get sync failed"
-    else
+    info "synchronizing configured ports collections with ports -u"
+
+    # prt-get manages packages from an already-synchronized ports tree; it has
+    # no 'sync' subcommand. CRUX updates collection trees with the ports tool.
+    if [ -x "$TARGET/usr/bin/ports" ]; then
         chroot "$TARGET" /usr/bin/ports -u || die "ports -u failed"
+    elif [ -x "$TARGET/usr/sbin/ports" ]; then
+        chroot "$TARGET" /usr/sbin/ports -u || die "ports -u failed"
+    else
+        die "the CRUX ports updater was not found in the target system"
     fi
 }
 
@@ -2340,6 +2348,144 @@ rejected_files_warning() {
     warn "review them with rejmerge before rebooting into an upgraded system"
 }
 
+mount_source_for() {
+    point=$1
+    if have findmnt; then
+        findmnt -n -o SOURCE --target "$point" 2>/dev/null | head -n 1
+    else
+        awk -v p="$point" '$2 == p {print $1; exit}' /proc/mounts 2>/dev/null
+    fi
+}
+
+resume_mount_existing_system() {
+    say ""
+    say "Resume target selection"
+    say "-----------------------"
+    say "This mode does not format or repartition anything."
+
+    select_disk
+
+    if is_mounted "$TARGET"; then
+        mounted_root=$(mount_source_for "$TARGET")
+        say "Detected $TARGET already mounted from ${mounted_root:-an unknown device}."
+        case "$mounted_root" in
+            /dev/*)
+                rdiskr=$mounted_root
+                ;;
+            *)
+                die "cannot safely identify the block device mounted at $TARGET"
+                ;;
+        esac
+        validate_block_or_die "mounted root partition" "$rdiskr"
+        case " $(partition_candidates) " in
+            *" $rdiskr "*) ;;
+            *) die "$rdiskr is not a partition on selected disk $rdisk" ;;
+        esac
+    else
+        while :; do
+            select_existing_partition "Existing CRUX root" no || continue
+            rdiskr=$SELECTED_BLOCK
+            break
+        done
+        root_fs=$(blk_value TYPE "$rdiskr")
+        [ -n "$root_fs" ] || die "could not detect a filesystem on $rdiskr"
+        mount_root_target
+    fi
+
+    root_fs=$(blk_value TYPE "$rdiskr")
+    [ -n "$root_fs" ] || root_fs=$(awk -v p="$TARGET" '$2 == p {print $3; exit}' /proc/mounts 2>/dev/null)
+    [ -n "$root_fs" ] || die "could not determine the root filesystem type"
+
+    [ -x "$TARGET/bin/sh" ] || die "$rdiskr does not look like an installed CRUX root"
+
+    boot=""
+    if is_uefi; then
+        if is_mounted "$TARGET/boot"; then
+            boot=$(mount_source_for "$TARGET/boot")
+            case "$boot" in /dev/*) ;; *) boot="" ;; esac
+            [ -n "$boot" ] && info "reusing EFI partition $boot mounted at $TARGET/boot"
+        fi
+        if [ -z "$boot" ]; then
+            suggested_esp=$(find_esp_candidate || true)
+            [ -n "$suggested_esp" ] && say "Detected likely EFI System Partition: $suggested_esp"
+            while :; do
+                select_existing_partition "EFI System" no || continue
+                boot=$SELECTED_BLOCK
+                [ "$boot" != "$rdiskr" ] || { warn "root and EFI partitions cannot be the same"; continue; }
+                [ "$(blk_value TYPE "$boot")" = vfat ] || { warn "$boot is not FAT32/vfat"; continue; }
+                break
+            done
+            mkdir -p "$TARGET/boot"
+            mount "$boot" "$TARGET/boot" || die "failed to mount EFI partition $boot"
+        fi
+    fi
+
+    sw=""
+    home=""
+    home_fs=""
+    if is_mounted "$TARGET/home"; then
+        home=$(mount_source_for "$TARGET/home")
+        case "$home" in /dev/*) home_fs=$(blk_value TYPE "$home") ;; *) home="" ;; esac
+    fi
+}
+
+default_existing_user() {
+    awk -F: '$3 >= 1000 && $3 < 65534 && $1 != "nobody" {print $1; exit}' "$TARGET/etc/passwd" 2>/dev/null
+}
+
+select_resume_user() {
+    detected_user=$(default_existing_user)
+    [ -n "$detected_user" ] || detected_user=user
+    while :; do
+        user_name=$(ask "Existing desktop user" "$detected_user")
+        valid_username "$user_name" || { warn "invalid user name"; continue; }
+        if grep -q "^${user_name}:" "$TARGET/etc/passwd" 2>/dev/null; then
+            return 0
+        fi
+        warn "user '$user_name' does not exist in the target system"
+        if confirm "Create accounts and set passwords now?" "y"; then
+            configure_passwords_and_user
+            return 0
+        fi
+    done
+}
+
+resume_install() {
+    install_mode=resume
+    say ""
+    say "Interrupted-install recovery"
+    say "----------------------------"
+    say "Use this after the base system and user account were created but a later"
+    say "desktop, repository, kernel, or bootloader step failed. Nothing is formatted."
+
+    configure_identity
+    configure_install_network
+    resume_mount_existing_system
+    verify_base_install
+    mount_bindings
+    copy_resolver_configuration
+    select_resume_user
+    collect_optional_choices
+    configure_repositories
+    configure_privilege_escalation
+    update_installed_ports
+    verify_selected_port_plan
+    prepare_graphics_stack
+    prepare_flatpak_stack
+    configure_desktop
+    configure_flatpak
+    write_system_configuration
+    build_kernel
+    install_gpu_drivers
+    write_system_configuration
+    install_bootloader
+    validate_installation
+    rejected_files_warning
+    write_postinstall_notes
+    show_summary
+    finish_menu
+}
+
 upgrade_install() {
     install_mode=upgrade
     say ""
@@ -2520,6 +2666,7 @@ self_test() {
     [ "$(partdev 3)" = /dev/sda3 ] || failures=$((failures + 1))
     FS_RESULT=ext4
     case "$FS_RESULT" in ext4|btrfs|xfs|jfs|ext3|ext2) ;; *) failures=$((failures + 1)) ;; esac
+    command -v ports >/dev/null 2>&1 || true
     if [ "$failures" -ne 0 ]; then
         printf 'self-test: FAIL (%s checks failed)\n' "$failures" >&2
         return 1
@@ -2545,7 +2692,7 @@ main() {
         --shell)
             exit 0
             ;;
-        --install|--upgrade|'') ;;
+        --install|--resume|--upgrade|'') ;;
         *)
             show_help >&2
             exit 2
@@ -2556,6 +2703,7 @@ main() {
     show_banner
     case "${1:-}" in
         --install) fresh_install ;;
+        --resume) resume_install ;;
         --upgrade) upgrade_install ;;
         '') main_menu ;;
     esac
